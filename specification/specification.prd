@@ -1,0 +1,74 @@
+🧾 PRD: Crocido Scraper – Visual Ecommerce Scraper Tool (Chrome Extension)
+🔧 Core Features
+1. Visual Selector Tool
+Users click a browser extension icon to enter “Scraper Setup Mode”
+
+A point-and-click UI (like Chrome DevTools) lets users hover/highlight elements
+
+XPath for each selected element is auto-captured
+
+Users can override the label (e.g. “Product Title”)
+
+Mandatory fields: Title, Price, Link
+
+Optional fields: Description, Brand, EAN, Image(s), Currency
+
+2. Product Container Detection
+User must select at least 2 products
+
+Crocido will auto-detect a common XPath pattern for the full container
+
+If the page layout changes (e.g. product pages vs list pages), user can define multiple layout configs
+
+3. Pagination & Infinite Scroll Detection
+Auto-detect:
+
+Pagination links
+
+Load more buttons (look for classes or buttons with relevant labels)
+
+Infinite scrolling via XHR requests
+
+Log XHR requests while scrolling and match endpoints returning new products
+
+GraphQL or other formats will be detected and parsed if possible
+
+4. Sitewide Category Detection
+Check for /sitemap.xml and detect:
+
+Category URLs
+
+Product listing pages
+
+Also scan for in-page <a> links that lead to category pages
+
+User can toggle which categories to include in the scrape
+
+5. Headers, Cookies, Anti-bot Measures
+Capture request headers and cookies used on the site
+
+Note presence of bot protection (Cloudflare, CAPTCHA, etc.)
+
+These are saved but not bypassed in-browser
+
+Stored headers used later for server-side scraping
+
+6. Saving Config & Exporting
+User config (selectors, site structure, category list, headers) is saved to Postgres DB
+
+Each user has a unique ID and API key
+
+Scraper config is tied to the user
+
+Export scraped results as a CSV (browser download or server pull)
+
+Backend writes scraped data to database in real time
+
+🧪 Error Handling & Testing
+If a selector is missing on a product, skip that product silently
+
+Run both unit tests and integration tests
+
+Testing is manual (no CI for now)
+
+Targeting Chrome only

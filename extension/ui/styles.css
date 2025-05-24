@@ -1,0 +1,312 @@
+/* Styles for the extension popup */
+#crocido-popup-body {
+  font-family: sans-serif;
+  width: 300px;
+  padding: 10px;
+  box-sizing: border-box; /* Good practice to include */
+}
+
+#crocido-popup-body h1 {
+  font-size: 1.2em;
+  text-align: center;
+  margin-top: 0; /* Adjust if padding creates too much space */
+  margin-bottom: 15px;
+}
+
+#crocido-popup-body button {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  margin-bottom: 10px;
+  box-sizing: border-box;
+  text-align: center;
+  cursor: pointer;
+  /* Specific button styling for popup can go here if different from sidebar buttons */
+}
+
+/* Styles for selector highlighter and tooltip (injected into web pages) */
+.crocido-highlight {
+  border: 2px dashed red;
+  background-color: rgba(255, 0, 0, 0.2);
+  box-sizing: border-box;
+  position: absolute; /* or fixed, depending on need */
+  pointer-events: none; /* So it doesn't interfere with clicks on the page */
+  z-index: 99999; /* High z-index to be on top */
+}
+
+.crocido-tooltip {
+  position: absolute; /* or fixed */
+  background-color: black;
+  color: white;
+  padding: 5px;
+  border-radius: 3px;
+  font-size: 12px;
+  z-index: 100000; /* Even higher z-index */
+  pointer-events: none;
+}
+
+/* Sidebar UI for Setup Mode (injected into web pages) */
+#crocido-setup-sidebar {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  width: 350px;
+  max-height: 90vh;
+  overflow-y: auto;
+  background-color: #f9f9f9;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  padding: 15px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+  z-index: 100001; /* Ensure it's above tooltip and highlighter */
+  font-family: Arial, sans-serif;
+  font-size: 14px;
+}
+
+#crocido-setup-sidebar h3 {
+  margin-top: 0;
+  font-size: 16px;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+}
+
+#crocido-setup-sidebar p {
+  font-size: 13px;
+  color: #555;
+  margin-bottom: 15px;
+}
+
+#crocido-selected-list {
+  list-style-type: none;
+  padding: 0;
+  margin: 0 0 15px 0;
+}
+
+.crocido-sidebar-item {
+  background-color: #fff;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  padding: 10px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.crocido-name-input {
+  width: calc(100% - 10px); /* Adjust for padding */
+  padding: 6px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-size: 13px;
+  margin-bottom: 5px;
+}
+
+.crocido-xpath-display {
+  font-family: monospace;
+  font-size: 11px;
+  color: #333;
+  background-color: #f0f0f0;
+  padding: 3px 5px;
+  border-radius: 3px;
+  word-break: break-all; /* Prevent long XPaths from breaking layout */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px; /* Adjust as needed */
+  display: inline-block;
+}
+
+#crocido-setup-sidebar button {
+  background-color: #007bff;
+  color: white;
+  border: none;
+  padding: 8px 12px;
+  text-align: center;
+  text-decoration: none;
+  display: inline-block;
+  font-size: 13px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-right: 5px;
+  margin-top: 5px;
+}
+
+#crocido-setup-sidebar button.crocido-remove-btn {
+  background-color: #dc3545;
+  align-self: flex-end;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+#crocido-setup-sidebar button#crocido-save-config {
+  background-color: #28a745;
+  width: auto;
+}
+
+#crocido-setup-sidebar button#crocido-close-setup {
+  background-color: #6c757d;
+  width: auto;
+}
+
+/* Styles for Product Container Detection section */
+#crocido-setup-sidebar h4 {
+  font-size: 15px;
+  color: #333;
+  border-top: 1px solid #eee;
+  padding-top: 15px;
+  margin-top: 20px;
+  margin-bottom: 10px;
+}
+
+#crocido-container-detection-info {
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 10px;
+  min-height: 1em; /* Prevent layout shifts */
+}
+
+#crocido-start-container-select {
+  background-color: #17a2b8; /* Info blue */
+  margin-bottom: 8px;
+}
+
+#crocido-start-container-select.active {
+  background-color: #ffc107; /* Warning yellow */
+  color: #212529;
+}
+
+#crocido-container-xpath-display {
+  width: calc(100% - 12px); /* Adjust for padding */
+  padding: 6px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-family: monospace;
+  font-size: 11px;
+  margin-bottom: 8px;
+  background-color: #e9ecef; /* Light grey for readonly-like appearance initially */
+}
+
+#crocido-confirm-container-xpath {
+  background-color: #28a745; /* Success green */
+}
+
+#crocido-confirm-container-xpath:disabled {
+  background-color: #6c757d; /* Muted when disabled */
+  cursor: not-allowed;
+}
+
+.crocido-container-preview-highlight {
+  border: 3px solid #28a745; /* Green border for container preview */
+  background-color: rgba(40, 167, 69, 0.15); /* Light green semi-transparent background */
+  box-sizing: border-box;
+  position: absolute;
+  pointer-events: none;
+  z-index: 99998; /* Below individual highlighter but above most page content */
+}
+
+/* Styles for Pagination & Scrolling section */
+#crocido-pagination-method {
+  width: 100%;
+  padding: 8px;
+  margin-bottom: 8px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  background-color: white;
+  font-size: 13px;
+}
+
+#crocido-pagination-selector {
+  width: calc(100% - 12px); /* Adjust for padding */
+  padding: 6px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-size: 13px;
+  margin-bottom: 5px;
+}
+
+#crocido-pagination-help {
+  margin-top: -5px; /* Pull closer to the input field */
+  margin-bottom: 10px;
+}
+
+#crocido-xhr-scroll-delay {
+  padding: 6px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-size: 13px;
+  margin-left: 5px; /* Align with other inputs/selects if they have margin */
+  width: auto; /* Let it size based on content or add specific width */
+  max-width: 120px; /* Prevent it from becoming too wide */
+}
+
+/* Styles for Category Detection section */
+#crocido-detect-categories {
+  background-color: #007bff; /* Primary blue, same as other main action buttons */
+  color: white;
+  margin-bottom: 10px;
+  /* width: auto; remove if full-width buttons are default */
+}
+
+#crocido-detect-categories:disabled {
+  background-color: #6c757d;
+  cursor: not-allowed;
+}
+
+#crocido-category-list-editor textarea {
+  width: 100%; /* Take full width of its container */
+  box-sizing: border-box; /* Include padding and border in the element's total width and height */
+  padding: 8px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-size: 13px;
+  min-height: 80px; /* Increased height */
+  margin-bottom: 10px;
+}
+
+#crocido-detected-categories-container {
+  border: 1px solid #ddd;
+  background-color: #f9f9f9;
+  padding: 10px;
+  margin-top: 5px;
+  margin-bottom: 10px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+#crocido-detected-categories-container ul {
+  list-style-type: none;
+  padding: 0;
+  margin: 0;
+}
+
+#crocido-detected-categories-container li {
+  padding: 3px 0;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+}
+
+#crocido-detected-categories-container input[type="checkbox"] {
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+#crocido-detected-categories-container label {
+  word-break: break-all;
+  line-height: 1.3;
+  vertical-align: middle;
+}
+
+#crocido-detect-page-links {
+  background-color: #17a2b8; /* Info blue, distinct from sitemap button */
+  color: white;
+  margin-bottom: 10px;
+  /* Adjust width or display if needed, e.g., display: inline-block if next to sitemap button */
+}
+
+#crocido-detect-page-links:disabled {
+  background-color: #6c757d;
+  cursor: not-allowed;
+} 
