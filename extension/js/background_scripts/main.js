@@ -15,27 +15,100 @@ let currentScraperConfig = {
 let detectedSitemapCategoryUrls = []; // Temporary store for URLs from sitemap
 let detectedPageLinkCategoryUrls = []; // Temporary store for URLs from page links
 
+// Keep track of the tabId for which the currentScraperConfig is relevant
+let activeConfigContextTabId = null;
+
 chrome.runtime.onInstalled.addListener(() => {
   console.log("Crocido Scraper Extension Installed");
   chrome.storage.local.get(['apiKey', 'scraperConfigs', 'currentScraperConfig'], (result) => {
     if (!result.apiKey) chrome.storage.local.set({ apiKey: null });
     if (!result.scraperConfigs) chrome.storage.local.set({ scraperConfigs: [] });
-    if (result.currentScraperConfig) {
-      // If a previous currentScraperConfig was saved, load it.
-      // currentScraperConfig = result.currentScraperConfig;
-      // console.log("Loaded currentScraperConfig from storage:", currentScraperConfig);
-      // For safety, start fresh or merge carefully. Starting fresh for now.
-      chrome.storage.local.set({ currentScraperConfig: currentScraperConfig });
+    
+    if (result.currentScraperConfig && result.currentScraperConfig.id) {
+      // If a valid currentScraperConfig (with an ID) was saved, load it into the in-memory variable.
+      currentScraperConfig = result.currentScraperConfig;
+      console.log("Loaded currentScraperConfig from storage:", currentScraperConfig);
+      // No need to set it back to storage here if it was already there and valid.
     } else {
+      // If no valid currentScraperConfig in storage (or it lacks an ID), 
+      // set the default (in-memory) one to storage.
+      // This default one will get an ID upon the first saveConfiguration.
       chrome.storage.local.set({ currentScraperConfig: currentScraperConfig });
+      console.log("Initialized default currentScraperConfig in storage:", currentScraperConfig);
     }
   });
 });
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  console.log("Message received in background:", request.action, "from:", sender.tab ? `Tab ${sender.tab.id}`: "Extension");
+  console.log("Message received in background:", request.action, "from:", sender.tab ? `Tab ${sender.tab.id}`: "Extension", "Domain in request:", request.domain);
 
-  if (request.action === "elementSelected") {
+  if (request.action === "popupOpened") {
+    const { domain, tabId } = request;
+    activeConfigContextTabId = tabId; // Store the tabId for context
+
+    chrome.storage.local.get(['scraperConfigs', 'apiKey'], (result) => {
+      if (chrome.runtime.lastError) {
+        console.error("Storage error in popupOpened:", chrome.runtime.lastError.message);
+        sendResponse({ statusMessage: "Error accessing storage.", configLoaded: false });
+        return;
+      }
+
+      const configs = result.scraperConfigs || [];
+      const apiKey = result.apiKey;
+      const existingConfig = configs.find(c => c.domain === domain);
+
+      if (existingConfig) {
+        console.log(`Found existing config for domain ${domain}:`, existingConfig);
+        currentScraperConfig = { ...existingConfig }; // Update in-memory
+        chrome.storage.local.set({ currentScraperConfig: currentScraperConfig }, () => {
+          if (chrome.runtime.lastError) {
+            console.error("Error setting currentScraperConfig in storage:", chrome.runtime.lastError.message);
+            sendResponse({ statusMessage: "Error saving active config.", configLoaded: false, apiKey: apiKey });
+          } else {
+            console.log("Set active config in storage for domain:", domain);
+            sendResponse({ 
+              statusMessage: `Existing config for ${domain} loaded.`, 
+              configLoaded: true, 
+              configName: currentScraperConfig.configName,
+              apiKey: apiKey
+            });
+          }
+        });
+      } else {
+        console.log(`No existing config found for domain ${domain}. Initializing new default.`);
+        // Initialize a new default config for this domain
+        currentScraperConfig = {
+          domain: domain,
+          selectors: [],
+          headers: {},
+          categoryUrls: [],
+          paginationMethod: 'none',
+          paginationDetails: {},
+          detectedXhrPatterns: [],
+          productContainersXpath: null,
+          configName: `New Config for ${domain}`,
+          id: null, // No ID until saved
+          createdAt: null,
+          lastUpdated: null
+        };
+        chrome.storage.local.set({ currentScraperConfig: currentScraperConfig }, () => {
+          if (chrome.runtime.lastError) {
+            console.error("Error setting new default currentScraperConfig in storage:", chrome.runtime.lastError.message);
+            sendResponse({ statusMessage: "Error initializing new config.", configLoaded: false, apiKey: apiKey });
+          } else {
+            console.log("Initialized new default config in storage for domain:", domain);
+            sendResponse({ 
+              statusMessage: `Ready to create new config for ${domain}.`, 
+              configLoaded: false, 
+              apiKey: apiKey 
+            });
+          }
+        });
+      }
+    });
+    return true; // Indicates asynchronous response
+
+  } else if (request.action === "elementSelected") {
     // Received from content script (selector_tool.js)
     console.log(`Element selected: ${request.tagName} - ${request.xpath}`);
     // This data is now primarily handled by the content script's sidebar.
@@ -236,6 +309,83 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     });
     return true; // Indicates that the response will be sent asynchronously
 
+  } else if (request.action === "startLocalScrape") {
+    console.log("'startLocalScrape' action received in background. Save to server:", request.saveToServer);
+    const shouldSaveToServer = request.saveToServer || false;
+
+    chrome.storage.local.get(['currentScraperConfig', 'apiKey'], (result) => {
+      if (chrome.runtime.lastError) {
+        console.error("Error getting currentScraperConfig for local scrape:", chrome.runtime.lastError.message);
+        sendResponse({statusMessage: "Error: Could not retrieve config for local scrape.", error: true});
+        return;
+      }
+      const localConfig = result.currentScraperConfig;
+      const apiKey = result.apiKey; // May or may not be needed for purely local CSV, but good to have.
+
+      if (!localConfig || !localConfig.domain) { // Domain is a good proxy for a config being at least initialized
+        console.error("No valid configuration loaded to start local scrape. Domain missing.");
+        sendResponse({statusMessage: "Error: No valid configuration loaded for the current page to start local scraping.", error: true});
+        return;
+      }
+      // We need an ID if we intend to save results to backend later, but not strictly for local CSV download.
+      if (!localConfig.id) {
+          console.warn("Local scrape initiated for a configuration that hasn't been saved yet (no ID). Results can only be downloaded as CSV.");
+          // Proceed, but saving to backend for this scrape won't be possible without a config ID.
+      }
+
+      console.log("Preparing for local scrape with config:", JSON.parse(JSON.stringify(localConfig)));
+      
+      if (!activeConfigContextTabId) {
+        console.error("Cannot start local scrape: activeConfigContextTabId is not set. Was popupOpened called?");
+        sendResponse({statusMessage: "Error: Active tab context not established for local scraping.", error: true});
+        return; // Important to return here
+      }
+
+      // Send the config to the content script of the active tab to perform the scrape
+      chrome.tabs.sendMessage(activeConfigContextTabId, 
+        { action: "executeLocalScrape", config: localConfig }, 
+        (scrapeResponse) => {
+          if (chrome.runtime.lastError) {
+            console.error("Error messaging content script for local scrape or receiving response:", chrome.runtime.lastError.message);
+            // No sendResponse() here to popup, as it might have closed. Log and potentially notify via other means if needed.
+            // Or, if popup is likely still open, we could try to send an error status update.
+            return;
+          }
+          if (scrapeResponse && scrapeResponse.success && scrapeResponse.data) {
+            console.log("Local scrape successful. Data received from content script:", scrapeResponse.data.length, "items.");
+            let csvDownloaded = false;
+            if (scrapeResponse.data.length > 0) {
+              const csvData = convertArrayOfObjectsToCSV(scrapeResponse.data);
+              triggerCSVDownload(csvData, localConfig.configName || localConfig.domain);
+              csvDownloaded = true;
+            } else {
+              console.log("No data returned from local scrape to download.");
+            }
+
+            // Optionally send data to backend
+            if (shouldSaveToServer && scrapeResponse.data.length > 0) {
+              if (localConfig.id) {
+                console.log("Attempting to save locally scraped data to backend for config ID:", localConfig.id);
+                saveLocalDataToBackend(scrapeResponse.data, localConfig.id, apiKey)
+                  .then(backendResponse => console.log("Backend save response:", backendResponse))
+                  .catch(err => console.error("Error saving local data to backend:", err));
+              } else {
+                console.warn("Cannot save local data to backend: Configuration has no ID (it might not have been saved yet).");
+              }
+            } else if (shouldSaveToServer && scrapeResponse.data.length === 0) {
+                console.log("Save to server was checked, but no data was scraped locally.");
+            }
+
+          } else {
+            console.error("Local scrape failed or returned no data. Response:", scrapeResponse);
+          }
+        }
+      );
+      // Initial response to popup to confirm initiation
+      sendResponse({statusMessage: "Local scraping process initiated with current config. Content script contacted.", configDomain: localConfig.domain });
+    });
+    return true; // Indicates asynchronous response.
+
   } else if (request.action === "exportCsv") {
     console.log("Export CSV initiated in background.");
     chrome.storage.local.get(['currentScraperConfig', 'apiKey'], async (result) => {
@@ -312,6 +462,53 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     sendResponse({status: "XHR details received and processed by background"});
     return; // Explicit return for this specific handler if no further async response needed from here.
+  } else if (request.action === "initiateSetupForTab") {
+    const { tabId, domain } = request;
+    console.log(`'initiateSetupForTab' requested for tab ${tabId}, domain ${domain}`);
+    // currentScraperConfig should already be set by popupOpened or be the default in-memory one.
+    // We ensure it matches the requested domain, crucial if popupOpened wasn't the last message.
+    if (currentScraperConfig && currentScraperConfig.domain === domain) {
+      console.log("Proceeding with currentScraperConfig for setup:", currentScraperConfig);
+      chrome.tabs.sendMessage(tabId, {action: "startSetup", config: currentScraperConfig}, (response) => {
+        if (chrome.runtime.lastError) {
+          console.error(`Error sending 'startSetup' to content script for tab ${tabId}:`, chrome.runtime.lastError.message);
+          sendResponse({status: `Error initializing setup on page: ${chrome.runtime.lastError.message}`});
+        } else {
+          console.log("'startSetup' message sent to content script, response:", response);
+          sendResponse({status: "Setup initiated on page.", data: response});
+        }
+      });
+    } else {
+      // This case should ideally be rare if popupOpened always precedes initiateSetupForTab for the same domain.
+      // However, as a fallback, reload/reinitialize the config for the domain.
+      console.warn(`currentScraperConfig domain (${currentScraperConfig ? currentScraperConfig.domain : 'N/A'}) does not match requested domain ${domain}. Re-fetching/initializing.`);
+      chrome.storage.local.get('scraperConfigs', (result) => {
+        const configs = result.scraperConfigs || [];
+        const existingConfig = configs.find(c => c.domain === domain);
+        if (existingConfig) {
+          currentScraperConfig = { ...existingConfig };
+        } else {
+          currentScraperConfig = {
+            domain: domain, selectors: [], headers: {}, categoryUrls: [], paginationMethod: 'none',
+            paginationDetails: {}, detectedXhrPatterns: [], productContainersXpath: null,
+            configName: `New Config for ${domain}`, id: null, createdAt: null, lastUpdated: null
+          };
+        }
+        // Save this re-evaluated currentScraperConfig to storage as well
+        chrome.storage.local.set({ currentScraperConfig: currentScraperConfig }, () => {
+            chrome.tabs.sendMessage(tabId, {action: "startSetup", config: currentScraperConfig}, (response) => {
+            if (chrome.runtime.lastError) {
+                console.error(`Error sending 'startSetup' to content script (after fallback) for tab ${tabId}:`, chrome.runtime.lastError.message);
+                sendResponse({status: `Error initializing setup on page (fallback): ${chrome.runtime.lastError.message}`});
+            } else {
+                console.log("'startSetup' message sent to content script (after fallback), response:", response);
+                sendResponse({status: "Setup initiated on page (fallback).", data: response});
+            }
+            });
+        });
+      });
+    }
+    return true; // Indicates asynchronous response
   }
   // Keep the message channel open for asynchronous responses if needed
   return true;
@@ -383,6 +580,96 @@ async function saveConfigToBackend(configData) {
     // Optionally, notify the user about the backend save error
     // chrome.runtime.sendMessage({action: "backendSaveError", message: error.message});
     throw error; // Re-throw the error so the caller (saveConfig handler) can catch it
+  }
+}
+
+// Helper function to convert array of objects to CSV format
+function convertArrayOfObjectsToCSV(dataArray) {
+  if (!dataArray || dataArray.length === 0) {
+    return '';
+  }
+  const columnDelimiter = ',';
+  const lineDelimiter = '\n';
+  const keys = Object.keys(dataArray[0]);
+
+  let result = '';
+  result += keys.join(columnDelimiter);
+  result += lineDelimiter;
+
+  dataArray.forEach(item => {
+    let ctr = 0;
+    keys.forEach(key => {
+      if (ctr > 0) result += columnDelimiter;
+      let value = item[key];
+      if (typeof value === 'string') {
+        // Escape double quotes by doubling them, and enclose in double quotes if it contains delimiter, newline or double quote
+        if (value.includes('"') || value.includes(columnDelimiter) || value.includes(lineDelimiter)) {
+          value = '"' + value.replace(/"/g, '""') + '"';
+        }
+      }
+      result += value;
+      ctr++;
+    });
+    result += lineDelimiter;
+  });
+  return result;
+}
+
+// Helper function to trigger CSV download
+function triggerCSVDownload(csvString, baseFileName = 'export') {
+  const blob = new Blob([csvString], { type: 'text/csv;charset=utf-uFEFF;' }); // Adding BOM for Excel compatibility
+  const url = URL.createObjectURL(blob);
+  const filename = `crocido_local_scrape_${baseFileName.replace(/[^a-z0-9_]/gi, '_')}_${new Date().toISOString().slice(0,10)}.csv`;
+
+  chrome.downloads.download({
+    url: url,
+    filename: filename,
+    saveAs: true // Prompt user for save location
+  }, (downloadId) => {
+    if (chrome.runtime.lastError) {
+      console.error("Error starting download:", chrome.runtime.lastError.message);
+    } else {
+      console.log("CSV Download started with ID:", downloadId);
+    }
+    URL.revokeObjectURL(url); // Clean up object URL
+  });
+}
+
+async function saveLocalDataToBackend(data, configId, apiKey) {
+  const backendBaseUrl = "http://localhost:3000"; // Ensure this is consistent
+  const endpoint = `${backendBaseUrl}/api/data/local-batch`;
+  console.log(`[saveLocalDataToBackend] Sending ${data.length} items to ${endpoint} for configId ${configId}`);
+
+  if (!apiKey) {
+    console.error("[saveLocalDataToBackend] API Key not available. Cannot send data.");
+    throw new Error("API Key not available for backend operation.");
+  }
+  if (!configId) {
+    console.error("[saveLocalDataToBackend] Config ID not available. Cannot send data.");
+    throw new Error("Config ID not available for backend operation.");
+  }
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({ configId: configId, items: data })
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`[saveLocalDataToBackend] Backend error: ${response.status}`, errorBody);
+      throw new Error(`Backend responded with ${response.status}: ${errorBody}`);
+    }
+    const result = await response.json();
+    console.log("[saveLocalDataToBackend] Data saved to backend successfully:", result);
+    return result;
+  } catch (error) {
+    console.error("[saveLocalDataToBackend] Error during fetch operation:", error);
+    throw error; // Re-throw to be caught by caller
   }
 }
 

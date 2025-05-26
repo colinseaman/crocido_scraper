@@ -5,7 +5,9 @@ let isSetupModeActive = false;
 let highlighter = null;
 let tooltip = null;
 let setupSidebar = null;
-let productContainerSelectionMode = false;
+let productContainerSelectionMode = false; // Will be 'awaitingFirstContainer', 'awaitingSecondContainer', or false
+let firstSelectedContainerXPath = null; // Store the first selected container's XPath
+let firstSelectedContainerElement = null; // ADDED: Store the first selected DOM element
 let selectedContainerXPaths = [];
 let detectedProductContainerXPath = null;
 let containerPreviewHighlighters = []; // Array to store highlighter elements
@@ -13,9 +15,6 @@ let detectedCategoryUrlsFromSitemap = [];
 let manualCategoryUrls = []; // To store manually added category URLs
 let isSelectingPaginationElement = false; // New state variable
 let currentFieldSelectionMode = null; // Possible values: "Title", "Price", "Description", "ImageSrc", null
-
-// NEW: Structure to hold custom field XPaths
-let customFieldSelectors = {};
 
 let currentConfigFromUI = {
   configName: '',
@@ -32,21 +31,75 @@ let currentConfigFromUI = {
 let predefinedFieldSelectors = {
   Title: { xpath: '', name: 'Title' },
   Price: { xpath: '', name: 'Price' },
-  ImageSrc: { xpath: '', name: 'ImageSrc' }      // Assuming image means src
+  ImageSrc: { xpath: '', name: 'ImageSrc' },      // Assuming image means src
+  Link: { xpath: '', name: 'Link' } // ADDED Link field
 };
 
 // Helper to get an element from an XPath
 function getElementByXPath(xpath) {
   try {
-    return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+    console.log("[Crocido getElementByXPath] Evaluating XPath:", xpath); // ADDED
+    const element = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+    if (!element) {
+        console.warn("[Crocido getElementByXPath] XPath did not find an element:", xpath); // ADDED
+    }
+    return element;
   } catch (e) {
-    console.error("Error evaluating XPath:", xpath, e);
+    console.error("[Crocido getElementByXPath] Error evaluating XPath:", xpath, e);
     return null;
   }
 }
 
 // MODIFIED getXPath function
 function getXPath(element, baseElement = null) {
+    console.log("[Crocido getXPath] Generating XPath for element:", element, "Is baseElement:", !!baseElement, baseElement);
+
+    if (baseElement) {
+        // Strategy for more robust relative XPaths:
+        // 1. Try direct child with specific classes or ID if unique within the baseElement
+        // 2. Try descendant with specific classes or ID
+        // 3. Fallback to basic relative path but make it less index-heavy if possible.
+
+        let relativePath = '';
+        // Attempt 1: Element's own tag and classes, if it's a direct child or easily identifiable
+        const tagName = element.tagName.toLowerCase();
+        let classSelector = '';
+        if (element.classList && element.classList.length > 0) {
+            // Create a selector from classes that are reasonably specific (e.g., not just "item")
+            const specificClasses = Array.from(element.classList).filter(c => c.length > 3 && !c.startsWith('js-'));
+            if (specificClasses.length > 0) {
+                classSelector = specificClasses.map(c => `contains(@class, '${c}')`).join(' and ');
+            }
+        }
+
+        if (classSelector) {
+            relativePath = `.//${tagName}[${classSelector}]`;
+            // Test this relative XPath FROM the baseElement
+            try {
+                const testResult = document.evaluate(relativePath, baseElement, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                let foundSelf = false;
+                for (let i = 0; i < testResult.snapshotLength; i++) {
+                    if (testResult.snapshotItem(i) === element) {
+                        foundSelf = true;
+                        break;
+                    }
+                }
+                if (foundSelf && testResult.snapshotLength === 1) { // Ideal: unique match
+                    console.log("[Crocido getXPath] Generated robust relative XPath (tag+class, unique):", relativePath);
+                    return relativePath;
+                } else if (foundSelf) {
+                    console.log("[Crocido getXPath] Generated relative XPath (tag+class, non-unique but contains self):", relativePath);
+                    // This might be okay if it's the first one. Add index if needed.
+                    // For now, we'll proceed and see if the default handles indexing better for non-unique.
+                    // Or, let it fall through to the more detailed path generation.
+                }
+            } catch (e) {
+                console.warn("[Crocido getXPath] Error testing class-based relative XPath:", e);
+            }
+        }
+         // Fallback to original relative path generation if specific class based one fails or is not specific enough
+    }
+
     // If element is the baseElement, its relative XPath is '.'
     if (element === baseElement) {
         return '.';
@@ -128,102 +181,140 @@ function getXPath(element, baseElement = null) {
     if (!baseElement && !finalPath.startsWith('/') && !finalPath.startsWith('id(')) {
         finalPath = '/' + finalPath;
     }
+    console.log("[Crocido getXPath] Generated XPath:", finalPath, "for element:", element); // ADDED logging
     return finalPath;
 }
 
-// New function to generalize XPaths for product containers
-function generalizeProductContainerXPaths(xpath1, xpath2) {
-  console.log("[Crocido] Attempting to generalize XPaths:", xpath1, xpath2);
-  const element1 = getElementByXPath(xpath1);
-  const element2 = getElementByXPath(xpath2);
+// New helper function for validation
+function validateGeneralizedXPath(xpath, el1, el2, minCount = 2) {
+  try {
+    const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    if (result.snapshotLength < minCount) {
+      console.warn(`[Crocido Validation] XPath '${xpath}' found ${result.snapshotLength} elements, expected at least ${minCount}.`);
+      return false;
+    }
+    
+    let found1 = false;
+    let found2 = false;
+    for (let i = 0; i < result.snapshotLength; i++) {
+      const item = result.snapshotItem(i);
+      if (item === el1) found1 = true;
+      if (item === el2) found2 = true;
+    }
+
+    if (found1 && found2) {
+      console.log(`[Crocido Validation] XPath '${xpath}' successful. Found ${result.snapshotLength} elements, including both selected items.`);
+      return true;
+    } else {
+      console.warn(`[Crocido Validation] XPath '${xpath}' found ${result.snapshotLength} elements, but did not include both original selections. Found1: ${found1}, Found2: ${found2}.`);
+      return false;
+    }
+  } catch (e) {
+    console.warn(`[Crocido Validation] Error evaluating XPath '${xpath}':`, e);
+    return false;
+  }
+}
+
+// MODIFIED: Now accepts elements directly
+function generalizeProductContainerXPaths(element1, element2) { // CHANGED: Accepts elements
+  console.log("[Crocido] Attempting to generalize XPaths for elements:", element1, element2);
+  // const element1 = getElementByXPath(xpath1); // REMOVED
+  // const element2 = getElementByXPath(xpath2); // REMOVED
 
   if (!element1 || !element2) {
-    console.warn("[Crocido] Could not find one or both elements for generalization. Falling back to common ancestor.");
-    return findCommonAncestorXPath([xpath1, xpath2]); // Fallback
+    console.warn("[Crocido] One or both elements for generalization are null.");
+    if (!element1) console.error("Element 1 is null");
+    if (!element2) console.error("Element 2 is null");
+    return null;
   }
 
-  // Scenario 1: Elements are siblings and share tag + classes
-  if (element1.parentNode === element2.parentNode && element1.tagName === element2.tagName) {
-    const parentXPath = getXPath(element1.parentNode);
-    const tagName = element1.tagName.toLowerCase();
-    let classConditions = "";
-    
-    if (element1.classList.length > 0 && element2.classList.length > 0) {
+  // Scenario 1: Elements are siblings
+  if (element1.parentNode === element2.parentNode) {
+    if (element1.tagName === element2.tagName) {
+      const parentXPath = getXPath(element1.parentNode);
+      const tagName = element1.tagName.toLowerCase();
+      
+      let classConditions = "";
+      if (element1.classList.length > 0 && element2.classList.length > 0) {
         const commonClasses = Array.from(element1.classList).filter(cls => element2.classList.contains(cls));
         if (commonClasses.length > 0) {
-            // Filter out very generic classes if possible, or ensure specificity
-            const specificCommonClasses = commonClasses.filter(c => c.length > 3 && !c.startsWith("js-") && !c.match(/^-?[_a-zA-Z]+[_a-zA-Z0-9-]*$/)); // Basic heuristic
-            const classesToUse = specificCommonClasses.length > 0 ? specificCommonClasses : commonClasses;
+          // Revised filter for specific classes
+          const specificCommonClasses = commonClasses.filter(c => c.length > 3 && !c.startsWith("js-"));
+          const classesToUse = specificCommonClasses.length > 0 ? specificCommonClasses : commonClasses;
+          if (classesToUse.length > 0) {
             classConditions = classesToUse.map(cls => `contains(@class, '${cls}')`).join(' and ');
+          }
         }
-    }
-
-    if (classConditions) {
-      const generalizedXPath = `${parentXPath}/${tagName}[${classConditions}]`;
-      console.log("[Crocido] Attempting generalized sibling XPath:", generalizedXPath);
-      try {
-        const resultTest = document.evaluate(generalizedXPath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-        let found1 = false;
-        let found2 = false;
-        for(let i=0; i < resultTest.snapshotLength; i++) {
-            if(resultTest.snapshotItem(i) === element1) found1 = true;
-            if(resultTest.snapshotItem(i) === element2) found2 = true;
-        }
-        if (found1 && found2 && resultTest.snapshotLength >= 2) {
-            console.log("[Crocido] Sibling generalization successful:", generalizedXPath);
-            return generalizedXPath;
-        } else {
-             console.warn("[Crocido] Sibling generalization didn't reliably find original elements or found too few. XPath:", generalizedXPath, "Found in document:", resultTest.snapshotLength);
-        }
-      } catch(e){
-          console.warn("[Crocido] Error testing sibling generalization:", e);
       }
-    } else if (element1.tagName === element2.tagName) {
-        // Siblings, same tag, no common classes. Try just tag.
-        const generalizedXPath = `${parentXPath}/${tagName}`;
-        console.log("[Crocido] Attempting generalized sibling XPath (tag only):", generalizedXPath);
-         try {
-            const resultTest = document.evaluate(generalizedXPath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-            if (resultTest.snapshotLength >= 2) { // Check if it finds at least two (could be more)
-                 console.log("[Crocido] Sibling generalization (tag only) seems plausible:", generalizedXPath);
-                 return generalizedXPath; // This might be too broad, but it's an option
-            }
-        } catch(e) { /* ignore */ }
-    }
-  }
 
-  // Scenario 2: Generalize based on tag and common classes globally (if not direct siblings or above failed)
-  if (element1.tagName === element2.tagName && element1.classList.length > 0 && element2.classList.length > 0) {
-    const tagName = element1.tagName.toLowerCase();
-    const commonClasses = Array.from(element1.classList).filter(cls => element2.classList.contains(cls));
-    if (commonClasses.length > 0) {
-        const specificCommonClasses = commonClasses.filter(c => c.length > 3 && !c.startsWith("js-") && !c.match(/^-?[_a-zA-Z]+[_a-zA-Z0-9-]*$/));
-        const classesToUse = specificCommonClasses.length > 0 ? specificCommonClasses : commonClasses;
-        const classConditions = classesToUse.map(cls => `contains(@class, '${cls}')`).join(' and ');
-        const generalizedXPath = `//${tagName}[${classConditions}]`;
-        console.log("[Crocido] Attempting generalized global XPath:", generalizedXPath);
-         try {
-            const resultTest = document.evaluate(generalizedXPath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-            let found1 = false;
-            let found2 = false;
-            for(let i=0; i < resultTest.snapshotLength; i++) {
-                if(resultTest.snapshotItem(i) === element1) found1 = true;
-                if(resultTest.snapshotItem(i) === element2) found2 = true;
-            }
-            if (found1 && found2 && resultTest.snapshotLength >= 2) {
-                console.log("[Crocido] Global generalization successful:", generalizedXPath);
-                return generalizedXPath;
-            } else {
-                 console.warn("[Crocido] Global generalization didn't reliably find original elements or found too few. XPath:", generalizedXPath, "Found in document:", resultTest.snapshotLength);
-            }
-        } catch(e){
-             console.warn("[Crocido] Error testing global generalization:", e);
+      // Attempt 1.1: Siblings, common tag, common classes
+      if (classConditions) {
+        const generalizedXPath = `${parentXPath}/${tagName}[${classConditions}]`;
+        console.log("[Crocido] Attempting SIBLING generalization (tag + classes):", generalizedXPath);
+        if (validateGeneralizedXPath(generalizedXPath, element1, element2)) {
+          return generalizedXPath;
         }
+      }
+      
+      // Attempt 1.2: Siblings, common tag, NO common classes (or class-based failed)
+      const generalizedXPathTagOnly = `${parentXPath}/${tagName}`;
+      console.log("[Crocido] Attempting SIBLING generalization (tag only):", generalizedXPathTagOnly);
+      if (validateGeneralizedXPath(generalizedXPathTagOnly, element1, element2)) {
+        return generalizedXPathTagOnly;
+      }
+    } else {
+      console.warn("[Crocido] Selected elements are siblings but have different tags. Cannot use sibling generalization by tag.", element1.tagName, element2.tagName);
     }
   }
 
-  console.log("[Crocido] All specific generalizations failed or not applicable. Falling back to common ancestor XPath.");
-  return findCommonAncestorXPath([xpath1, xpath2]);
+  // Scenario 2: Elements are NOT siblings, or sibling generalization failed.
+  // Try global search with tag and common classes if elements share a tag.
+  if (element1.tagName === element2.tagName) {
+      if (element1.classList.length > 0 && element2.classList.length > 0) {
+        const tagName = element1.tagName.toLowerCase();
+        const commonClasses = Array.from(element1.classList).filter(cls => element2.classList.contains(cls));
+        if (commonClasses.length > 0) {
+          const specificCommonClasses = commonClasses.filter(c => c.length > 3 && !c.startsWith("js-"));
+          const classesToUse = specificCommonClasses.length > 0 ? specificCommonClasses : commonClasses;
+          if (classesToUse.length > 0) {
+            const classConditions = classesToUse.map(cls => `contains(@class, '${cls}')`).join(' and ');
+            const generalizedXPath = `//${tagName}[${classConditions}]`;
+            console.log("[Crocido] Attempting GLOBAL generalization (tag + classes):", generalizedXPath);
+            if (validateGeneralizedXPath(generalizedXPath, element1, element2)) {
+              return generalizedXPath;
+            }
+          }
+        }
+      }
+
+      // Scenario 3: Fallback to common ancestor + child tag
+      const ancestorPath = findCommonAncestorXPath([element1, element2]); // CHANGED: Pass elements
+      const childTagName = element1.tagName.toLowerCase();
+      if (ancestorPath) {
+        const generalizedXPathAncestorChild = `${ancestorPath}/${childTagName}`;
+        console.log("[Crocido] Attempting FALLBACK generalization (common ancestor + child tag):", generalizedXPathAncestorChild);
+        if (validateGeneralizedXPath(generalizedXPathAncestorChild, element1, element2)) {
+          return generalizedXPathAncestorChild;
+        }
+      }
+  }
+
+
+  console.warn("[Crocido] All generalization strategies failed. Falling back to the direct common ancestor path. This will likely select the parent container, not the list of items. Check if the two selected items are truly representative and share a clear common structure or parent.");
+  const directAncestorPath = findCommonAncestorXPath([element1, element2]); // CHANGED: Pass elements
+  if (directAncestorPath && element1 && element2) { // Ensure elements are available for this check
+      try {
+        const resultTest = document.evaluate(directAncestorPath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        if (resultTest.snapshotLength === 1) {
+            const singleMatch = resultTest.snapshotItem(0);
+            // Check if element1 and element2 are not null before calling contains
+            if (singleMatch && element1 && element2 && singleMatch.contains(element1) && singleMatch.contains(element2)) {
+                 console.warn(`[Crocido] The final fallback XPath '${directAncestorPath}' selects a single element that is an ancestor of both your selections. This means it's selecting a parent/wrapper, not the list of items themselves. You may need to select two items that are more direct siblings or have a more obvious repeating pattern at a lower level.`);
+            }
+        }
+      } catch(e) { console.warn("[Crocido] Error during diagnostic check for direct ancestor path:", e); }
+  }
+  return directAncestorPath; 
 }
 
 function getCssSelector(element) {
@@ -314,51 +405,52 @@ function hideTooltip() {
   }
 }
 
-function findCommonAncestorXPath(xpathList) {
-  if (!xpathList || xpathList.length === 0) return null;
-  if (xpathList.length === 1) return xpathList[0];
+// MODIFIED: Accepts array of elements
+function findCommonAncestorXPath(elements) { // CHANGED: Accepts elements
+  if (!elements || elements.length === 0) return null;
+  if (elements.length === 1) return getXPath(elements[0]); // Get XPath of the single element
 
-  const paths = xpathList.map(xpath => xpath.split('/').filter(p => p));
+  // Convert elements to their XPaths for path splitting logic (original logic can remain similar)
+  // Or, alternatively, walk up the DOM tree directly. Let's try DOM walking for robustness.
 
-  let shortestPathLength = Math.min(...paths.map(p => p.length));
-  let commonPrefix = [];
-
-  for (let i = 0; i < shortestPathLength; i++) {
-    const firstPathSegment = paths[0][i];
-    if (paths.every(p => p[i] === firstPathSegment)) {
-      commonPrefix.push(firstPathSegment);
-    } else {
-      // If segments differ, but elements at this level might still be what we want to generalize for containers
-      // e.g. /div/ul/li[1] and /div/ul/li[2] -> common ancestor is /div/ul
-      // The original function correctly breaks here. The generalization is handled by generalizeProductContainerXPaths
-      break;
-    }
-  }
-
-  if (commonPrefix.length === 0) {
-    console.warn("[Crocido] No common XPath prefix found for common ancestor.");
-    // Attempt to find a common ancestor element directly if paths are too different.
-    if (xpathList.length === 2) {
-        const el1 = getElementByXPath(xpathList[0]);
-        const el2 = getElementByXPath(xpathList[1]);
-        if (el1 && el2) {
-            let parent1 = el1.parentElement;
-            while(parent1) {
-                if (parent1.contains(el2)) return getXPath(parent1); // parent1 is an ancestor of el2
-                parent1 = parent1.parentElement;
-            }
-        }
-    }
-    return '/'; // Default if truly no commonality or error
+  if (elements.some(el => !el)) {
+    console.warn("[Crocido findCommonAncestorXPath] One or more elements in the list are null.");
+    return "/"; // Cannot determine common ancestor
   }
   
-  let commonAncestorPathString = commonPrefix.join('/');
-
-  if (commonAncestorPathString.startsWith('id(') || commonAncestorPathString.startsWith('/') || commonAncestorPathString.startsWith('//')) {
-    return commonAncestorPathString; 
-  } else {
-    return '//' + commonAncestorPathString;
+  let ancestors = [];
+  let currentElement = elements[0];
+  while (currentElement) {
+    ancestors.push(currentElement);
+    currentElement = currentElement.parentNode;
   }
+
+  for (let i = 1; i < elements.length; i++) {
+    let currentAncestors = [];
+    let el = elements[i];
+    while (el) {
+      if (ancestors.includes(el)) { // Found a common ancestor
+        // Prune the 'ancestors' list to this common one and its parents
+        ancestors = ancestors.slice(ancestors.indexOf(el));
+        break; 
+      }
+      el = el.parentNode;
+    }
+    if (!el) { // No common ancestor found with the current element in the list
+      console.warn("[Crocido findCommonAncestorXPath] No common ancestor found for all elements.");
+      return "/"; // Or a more appropriate fallback like body or html
+    }
+  }
+  
+  // The first element in the 'ancestors' list is now the lowest common ancestor
+  if (ancestors.length > 0) {
+    const commonAncestorElement = ancestors[0];
+    console.log("[Crocido findCommonAncestorXPath] Common ancestor element found:", commonAncestorElement);
+    return getXPath(commonAncestorElement); // Return XPath of the common ancestor element
+  }
+
+  console.warn("[Crocido findCommonAncestorXPath] Could not determine common ancestor. Defaulting to root.");
+  return "/"; // Default if truly no commonality or error
 }
 
 function clearContainerPreviewHighlighters() {
@@ -367,25 +459,33 @@ function clearContainerPreviewHighlighters() {
 }
 
 function resetContainerSelection() {
-  console.log("[Crocido] Resetting container selection.");
-  selectedContainerXPaths = [];
-  detectedProductContainerXPath = null;
-  clearContainerPreviewHighlighters();
-  productContainerSelectionMode = true; // Re-enable selection mode
-  // Update UI elements to reflect the reset state
-  if (setupSidebar) {
-    updateContainerDetectionUI(); // This should update the status message and button states
-    // Any other specific UI resets related to containers can go here
-    // For example, if fields section should be hidden until containers are re-confirmed:
-    // document.getElementById('crocido-field-selectors').style.display = 'none'; 
-    // (Adjust based on desired UI flow)
+  // Clear existing highlights for individual containers if any
+  if (containerPreviewHighlighters && containerPreviewHighlighters.length > 0) {
+      containerPreviewHighlighters.forEach(h => h.remove());
+      containerPreviewHighlighters = [];
   }
-  // Provide user feedback
-  const statusMsgEl = document.getElementById('crocido-status-message');
-  if (statusMsgEl) {
-    statusMsgEl.textContent = "Container selection has been reset. Please select new examples.";
-    setTimeout(() => { statusMsgEl.textContent = ""; }, 3000);
-  }
+  
+  productContainerSelectionMode = 'awaitingFirstContainer'; // Start by waiting for the first
+  firstSelectedContainerXPath = null;
+  detectedProductContainerXPath = null; // Clear any previously detected/generalized XPath
+  currentConfigFromUI.productContainersXpath = null; // Clear from config object
+
+  // Update UI elements
+  const pcStatus = document.getElementById('crocido-product-container-status');
+  const pcXpathDisplay = document.getElementById('crocido-pc-xpath-display');
+  const pcCountDisplay = document.getElementById('crocido-pc-count-display');
+  const previewButton = document.getElementById('crocido-preview-pc-button');
+  const clearButton = document.getElementById('crocido-clear-pc-button');
+  const selectButton = document.getElementById('crocido-select-pc-button');
+
+  if (pcStatus) pcStatus.textContent = 'Select the FIRST product container.';
+  if (pcXpathDisplay) pcXpathDisplay.textContent = 'No container XPath generated yet.';
+  if (pcCountDisplay) pcCountDisplay.textContent = '';
+  if (previewButton) previewButton.disabled = true;
+  if (selectButton) selectButton.textContent = 'Select First Container'; // Or similar text
+
+  console.log("[Crocido] Product container selection reset. Mode: awaitingFirstContainer");
+  updateContainerDetectionUI(); // Call this to refresh the entire block's state
 }
 
 function previewProductContainers(xpath) {
@@ -427,113 +527,64 @@ function previewProductContainers(xpath) {
 }
 
 function updateContainerDetectionUI() {
-  if (!setupSidebar) return;
-  const detectionStatusDiv = setupSidebar.querySelector('#crocido-container-detection-status');
-  const previewButton = setupSidebar.querySelector('#crocido-preview-containers');
+  const pcStatus = document.getElementById('crocido-product-container-status');
+  const pcXpathDisplay = document.getElementById('crocido-pc-xpath-display');
+  const pcCountDisplay = document.getElementById('crocido-pc-count-display');
+  const previewButton = document.getElementById('crocido-preview-pc-button');
+  const clearButton = document.getElementById('crocido-clear-pc-button');
+  const selectButton = document.getElementById('crocido-select-pc-button'); // Assuming this button starts the process or indicates current state
 
-  if (!detectionStatusDiv || !previewButton) {
-    console.error("Could not find container detection UI elements. Check IDs.");
+  if (!pcStatus || !pcXpathDisplay || !pcCountDisplay || !previewButton || !clearButton || !selectButton) {
+    console.warn("[Crocido] One or more UI elements for container detection are missing.");
     return;
   }
 
-  // Reset potential preview messages from info text
-  if (detectionStatusDiv.textContent.includes("(Preview found")) {
-      detectionStatusDiv.textContent = detectionStatusDiv.textContent.substring(0, detectionStatusDiv.textContent.indexOf("(Preview found"));
-  }
+  clearContainerPreviewHighlighters(); // Clear previous previews
 
-  if (productContainerSelectionMode) {
-    if (selectedContainerXPaths.length === 0) {
-      detectionStatusDiv.textContent = "Click on the first product container example on the page.";
+  if (productContainerSelectionMode === 'awaitingFirstContainer') {
+    pcStatus.textContent = 'Click on the FIRST example of a product container.';
+    selectButton.textContent = 'Cancel Selection'; // Or "Stop Selecting"
+    pcXpathDisplay.textContent = firstSelectedContainerXPath ? `1st: ${firstSelectedContainerXPath}` : 'No first container selected.';
+    pcCountDisplay.textContent = '';
+    previewButton.disabled = true;
+  } else if (productContainerSelectionMode === 'awaitingSecondContainer') {
+    pcStatus.textContent = 'Click on a SECOND, DISTINCT example of a product container.';
+    selectButton.textContent = 'Cancel Selection';
+    pcXpathDisplay.textContent = firstSelectedContainerXPath ? `1st: ${firstSelectedContainerXPath}` : 'Issue: First container XPath missing.';
+    pcCountDisplay.textContent = '';
+    previewButton.disabled = true;
+  } else if (detectedProductContainerXPath) { // A generalized XPath has been set
+    pcStatus.textContent = 'Product container XPath generated:';
+    selectButton.textContent = 'Reselect Containers'; // To restart the 2-click process
+    pcXpathDisplay.textContent = detectedProductContainerXPath;
+    try {
+      const elements = document.evaluate(detectedProductContainerXPath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      pcCountDisplay.textContent = `Matches: ${elements.snapshotLength} element(s).`;
+      previewButton.disabled = elements.snapshotLength === 0;
+      currentConfigFromUI.productContainersXpath = detectedProductContainerXPath; // Update config
+    } catch (e) {
+      pcCountDisplay.textContent = 'Error evaluating generated XPath.';
       previewButton.disabled = true;
-    } else if (selectedContainerXPaths.length === 1) {
-      detectionStatusDiv.textContent = "Click on a second product container example.";
-      previewButton.disabled = false; // Can preview the single selection
-    } else { // 2 or more selections made, generalization attempted
-      if (detectedProductContainerXPath) {
-        detectionStatusDiv.textContent = `Common XPath detected: ${detectedProductContainerXPath.substring(0, 50)}... Preview to verify.`;
-      } else {
-        // This case might occur if generalization failed
-        detectionStatusDiv.textContent = "Could not generalize from 2 selections. Try different examples or reset.";
-      }
-      previewButton.disabled = !detectedProductContainerXPath; // Enable preview if generalization was successful
     }
-  } else { // Product container selection mode is OFF (meaning XPath is considered set)
-    if (detectedProductContainerXPath) {
-      detectionStatusDiv.textContent = `Product Containers XPath: ${detectedProductContainerXPath.substring(0,50)}...`;
-      previewButton.disabled = false;
-    } else {
-      // Should ideally not happen if selection mode is off without a detected XPath
-      detectionStatusDiv.textContent = "No Product Container XPath set. Please select containers.";
-      previewButton.disabled = true;
-      productContainerSelectionMode = true; // Re-enable selection mode
-    }
+  } else { // Initial state or after clearing, not actively selecting
+    pcStatus.textContent = 'Product container XPath not yet defined.';
+    selectButton.textContent = 'Select Product Containers'; // To start the 2-click process
+    pcXpathDisplay.textContent = 'None';
+    pcCountDisplay.textContent = '';
+    previewButton.disabled = true;
   }
-}
-
-// NEW FUNCTION DEFINITION
-function handleAddCustomField() {
-  if (!setupSidebar) return;
-
-  const customFieldNameInput = document.getElementById('crocido-custom-field-name');
-  const fieldName = customFieldNameInput.value.trim();
-
-  if (!fieldName) {
-    alert("Please enter a name for the custom field.");
-    return;
-  }
-
-  // Sanitize fieldName to be used as an ID or key (basic example)
-  const sanitizedFieldName = fieldName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '');
-
-  if (predefinedFieldSelectors[sanitizedFieldName] || customFieldSelectors[sanitizedFieldName]) {
-    alert(`Field '${fieldName}' already exists.`);
-    return;
-  }
-
-  console.log(`[Crocido] Adding custom field: ${fieldName} (Sanitized: ${sanitizedFieldName})`);
-
-  // Add to custom selectors
-  customFieldSelectors[sanitizedFieldName] = { xpath: '', name: fieldName, isCustom: true };
-
-  // Create and append the new field block to the UI
-  const fieldSelectorsDiv = document.getElementById('crocido-field-selectors');
-  if (fieldSelectorsDiv) {
-    const newFieldBlock = createFieldSelectorBlock(sanitizedFieldName, fieldName); // Use original name as label
-    fieldSelectorsDiv.appendChild(newFieldBlock);
-    updateFieldSelectorBlockUI(sanitizedFieldName); // Update its UI state (e.g., disable clear button)
-  } else {
-    console.error("[Crocido] Could not find 'crocido-field-selectors' div to append custom field.");
-  }
-
-  customFieldNameInput.value = ''; // Clear the input
-}
-
-// NEW HELPER FUNCTION for loading config
-function addCustomFieldFromConfig(fieldName, xpath, name) {
-    if (predefinedFieldSelectors[fieldName] || customFieldSelectors[fieldName]) {
-        console.warn(`[Crocido] Field '${fieldName}' already exists or is predefined. Skipping duplicate from config.`);
-        return;
-    }
-    customFieldSelectors[fieldName] = { xpath: xpath, name: name, isCustom: true };
-    const fieldSelectorsDiv = document.getElementById('crocido-field-selectors');
-    if (fieldSelectorsDiv) {
-        const newFieldBlock = createFieldSelectorBlock(fieldName, name);
-        fieldSelectorsDiv.appendChild(newFieldBlock);
-        // updateFieldSelectorBlockUI will be called by updateAllFieldSelectorBlocksUI later in loadConfigIntoUI
-    } else {
-        console.error("[Crocido] Could not find 'crocido-field-selectors' div to append custom field from config.");
-    }
+  // Ensure the "Clear" button always calls resetContainerSelection to go back to 'awaitingFirstContainer' if active, or clear a generated one.
 }
 
 function createSetupUI() {
-  console.log("[Crocido] createSetupUI called."); // Ensure this log is present
+  console.log("[Crocido] createSetupUI called.");
   if (setupSidebar) {
     setupSidebar.style.display = 'block';
-    updateContainerDetectionUI(); // Update with current state
+    updateContainerDetectionUI();
     updateAllFieldSelectorBlocksUI();
     renderPaginationMethod();
-    renderDetectedXhrPatterns(); // Re-render XHR patterns if any
-    renderManualCategoryUrls(); // Re-render manual category URLs
+    renderDetectedXhrPatterns();
+    renderManualCategoryUrls();
     return;
   }
 
@@ -541,7 +592,6 @@ function createSetupUI() {
   setupSidebar.id = 'crocido-setup-sidebar';
   setupSidebar.classList.add('crocido-setup-sidebar');
 
-  // Initial basic structure
   setupSidebar.innerHTML = `
     <h3>Crocido Scraper Setup</h3>
     <div class="crocido-config-name-section">
@@ -558,30 +608,26 @@ function createSetupUI() {
     <div id="crocido-field-selectors">
       <!-- Field selectors will be added here by createFieldSelectorBlock -->
     </div>
-    <div id="crocido-add-custom-field-section">
-        <input type="text" id="crocido-custom-field-name" placeholder="Custom field name">
-        <button id="crocido-add-custom-field-btn">Add Custom Field</button>
-    </div>
     <hr>
     <h4>3. Category URLs</h4>
     <div id="crocido-category-urls-section">
         <p>Enter category URLs (one per line):</p>
         <textarea id="crocido-manual-category-urls" rows="5" style="width: 95%;"></textarea>
-        <button id="crocido-update-manual-categories">Update & Store Categories</button>
+        <button id="crocido-update-manual-categories" class="crocido-btn crocido-btn-sm">Update & Store Categories</button>
         <div id="crocido-manual-categories-stored-count">Stored: 0 URLs</div>
         <p>Detected from sitemap/page (auto-added): <span id="crocido-detected-category-count">0</span></p>
         <ul id="crocido-detected-category-list" style="max-height: 100px; overflow-y: auto; font-size: 0.9em;"></ul>
     </div>
     <hr>
     <h4>4. Pagination</h4>
-    <div id="crocido-pagination-options">
-        <label><input type="radio" name="paginationMethod" value="none" checked> None</label>
-        <label><input type="radio" name="paginationMethod" value="nextButton"> Next Button</label>
-        <label><input type="radio" name="paginationMethod" value="loadMoreButton"> Load More Button</label>
-        <label><input type="radio"   name="paginationMethod" value="xhrInfinite"> XHR/Infinite Scroll</label>
+    <div id="crocido-pagination-options" class="crocido-button-group">
+        <button class="crocido-btn crocido-btn-sm" data-method="none">None</button>
+        <button class="crocido-btn crocido-btn-sm" data-method="nextButton">Next Button</button>
+        <button class="crocido-btn crocido-btn-sm" data-method="loadMoreButton">Load More Button</button>
+        <button class="crocido-btn crocido-btn-sm" data-method="xhrInfinite">XHR/Infinite Scroll</button>
     </div>
     <div id="crocido-pagination-selector-section" style="display: none;">
-        <button id="crocido-select-pagination-element">Select Pagination Element</button>
+        <button id="crocido-select-pagination-element" class="crocido-btn crocido-btn-sm">Select Pagination Element</button>
         <span id="crocido-pagination-element-xpath"></span>
     </div>
     <div id="crocido-xhr-patterns-section" style="display:none;">
@@ -597,7 +643,6 @@ function createSetupUI() {
 
   document.body.appendChild(setupSidebar);
 
-  // Add listeners for new UI elements
   document.getElementById('crocido-reset-containers').addEventListener('click', resetContainerSelection);
   document.getElementById('crocido-preview-containers').addEventListener('click', () => {
     if (detectedProductContainerXPath) {
@@ -607,34 +652,28 @@ function createSetupUI() {
     }
   });
 
-  document.getElementById('crocido-add-custom-field-btn').addEventListener('click', handleAddCustomField);
-
-
-  // Add listeners for pagination options
-  document.querySelectorAll('input[name="paginationMethod"]').forEach(radio => {
-    radio.addEventListener('change', handlePaginationMethodChange);
+  document.querySelectorAll('#crocido-pagination-options button').forEach(button => {
+    button.addEventListener('click', handlePaginationMethodButtonClick);
   });
   document.getElementById('crocido-select-pagination-element').addEventListener('click', () => {
     isSelectingPaginationElement = true;
-    // Provide feedback to the user (e.g., change cursor, show message)
     document.getElementById('crocido-status-message').textContent = "Click on the pagination element (e.g., Next or Load More button).";
     hideSetupSidebarTemporarily();
   });
 
    document.getElementById('crocido-clear-xhr-patterns').addEventListener('click', () => {
         currentConfigFromUI.detectedXhrPatterns = [];
-        chrome.runtime.sendMessage({ action: "clearXhrPatternsInMemory" }, response => { // Inform background if it's also storing them
+        chrome.runtime.sendMessage({ action: "clearXhrPatternsInMemory" }, response => {
             console.log(response.status);
         });
-        renderDetectedXhrPatterns(); // Update UI
+        renderDetectedXhrPatterns();
     });
 
-  // Create blocks for predefined fields
   const fieldSelectorsDiv = document.getElementById('crocido-field-selectors');
   if (fieldSelectorsDiv) {
     Object.keys(predefinedFieldSelectors).forEach(fieldName => {
       const field = predefinedFieldSelectors[fieldName];
-      const newFieldBlock = createFieldSelectorBlock(field.name, field.name); // Use name as label for predefined
+      const newFieldBlock = createFieldSelectorBlock(field.name, field.name);
       fieldSelectorsDiv.appendChild(newFieldBlock);
     });
   } else {
@@ -643,56 +682,154 @@ function createSetupUI() {
 
   document.getElementById('crocido-save-config').addEventListener('click', saveCurrentConfig);
   document.getElementById('crocido-close-setup').addEventListener('click', () => toggleSetupMode(false));
-  
-  // Listener for the new category URL update button
   document.getElementById('crocido-update-manual-categories').addEventListener('click', updateManualCategoriesFromTextarea);
 
-
-  // Initial UI updates based on any existing state
   updateContainerDetectionUI();
   updateAllFieldSelectorBlocksUI();
   renderPaginationMethod();
   renderDetectedXhrPatterns();
-  loadConfigIntoUI(currentConfigFromUI); // Load current state if any (e.g. from storage)
-  renderManualCategoryUrls(); // Render manual category URLs
+  loadConfigIntoUI(currentConfigFromUI);
+  renderManualCategoryUrls();
+
+  // Product Container Section
+  const pcTitle = document.createElement('h3');
+  pcTitle.textContent = 'Product Containers';
+  setupSidebar.appendChild(pcTitle);
+
+  const pcStatus = document.createElement('div');
+  pcStatus.id = 'crocido-product-container-status';
+  pcStatus.textContent = 'Product container XPath not yet defined.';
+  setupSidebar.appendChild(pcStatus);
+
+  const pcXpathDisplay = document.createElement('div');
+  pcXpathDisplay.id = 'crocido-pc-xpath-display';
+  pcXpathDisplay.textContent = 'None';
+  pcXpathDisplay.style.wordBreak = 'break-all';
+  pcXpathDisplay.style.marginTop = '5px';
+  pcXpathDisplay.style.padding = '5px';
+  pcXpathDisplay.style.border = '1px solid #ccc';
+  pcXpathDisplay.style.minHeight = '20px';
+  setupSidebar.appendChild(pcXpathDisplay);
+
+  const pcCountDisplay = document.createElement('div');
+  pcCountDisplay.id = 'crocido-pc-count-display';
+  pcCountDisplay.textContent = '';
+  pcCountDisplay.style.marginTop = '5px';
+  setupSidebar.appendChild(pcCountDisplay);
+
+  const pcButtonsContainer = document.createElement('div');
+  pcButtonsContainer.style.marginTop = '10px';
+
+  const selectContainerButton = document.createElement('button');
+  selectContainerButton.id = 'crocido-select-pc-button';
+  selectContainerButton.textContent = 'Select Product Containers'; // Initial text
+  selectContainerButton.addEventListener('click', () => {
+    if (productContainerSelectionMode === 'awaitingFirstContainer' || productContainerSelectionMode === 'awaitingSecondContainer') {
+      // If already selecting, this button acts as a "Cancel"
+      productContainerSelectionMode = false; 
+      firstSelectedContainerXPath = null;
+      clearContainerPreviewHighlighters(); // Clear selection highlights
+      hideHighlighter(); // Clear general hover highlighter
+      hideTooltip();
+      console.log("[Crocido] Product container selection cancelled by user.");
+    } else {
+      // If not selecting, or if an XPath is already set, this button starts/restarts the process
+      // resetContainerSelection(); // This sets it to awaitingFirstContainer and updates UI
+      // More explicitly for starting:
+      productContainerSelectionMode = 'awaitingFirstContainer';
+      firstSelectedContainerXPath = null;
+      detectedProductContainerXPath = null;
+      currentConfigFromUI.productContainersXpath = null;
+      clearContainerPreviewHighlighters();
+      console.log("[Crocido] Started product container selection. Mode: awaitingFirstContainer.");
+    }
+    updateContainerDetectionUI(); // Update UI based on new mode
+  });
+  pcButtonsContainer.appendChild(selectContainerButton);
+
+  const previewContainerButton = document.createElement('button');
+  previewContainerButton.id = 'crocido-preview-pc-button';
+  previewContainerButton.textContent = 'Preview Containers';
+  previewContainerButton.disabled = true; // Initially disabled
+  previewContainerButton.addEventListener('click', () => {
+    if (detectedProductContainerXPath) {
+      previewProductContainers(detectedProductContainerXPath);
+    } else {
+      console.warn("[Crocido] Preview clicked but no XPath is set to preview.");
+      alert("No container XPath has been generated or set yet.");
+    }
+  });
+  pcButtonsContainer.appendChild(previewContainerButton);
+
+  const clearContainerButton = document.createElement('button');
+  clearContainerButton.id = 'crocido-clear-pc-button';
+  clearContainerButton.textContent = 'Clear XPath';
+  clearContainerButton.addEventListener('click', () => {
+     productContainerSelectionMode = false; // Explicitly stop any active selection
+     firstSelectedContainerXPath = null;
+     detectedProductContainerXPath = null;
+     currentConfigFromUI.productContainersXpath = null;
+     clearContainerPreviewHighlighters(); // Clear any visual feedback
+     hideHighlighter();
+     hideTooltip();
+     console.log("[Crocido] Product container XPath cleared and selection stopped.");
+     updateContainerDetectionUI(); // Refresh UI to initial/cleared state
+  });
+  pcButtonsContainer.appendChild(clearContainerButton);
+  setupSidebar.appendChild(pcButtonsContainer);
+  
+  // separator
+  const separatorPC = document.createElement('hr');
+  separatorPC.style.margin = '15px 0';
+  setupSidebar.appendChild(separatorPC);
+
+  // ... (rest of the UI creation code for fields, pagination, etc.)
+  // Update initial UI states
+  updateContainerDetectionUI(); 
+  updateAllFieldSelectorBlocksUI();
+  renderPaginationMethod();
+  // renderDetectedXhrPatterns(); // Assuming this is called when patterns are available
+  renderManualCategoryUrls();
+  updateDetectedCategoryListUI();
 }
 
 function createFieldSelectorBlock(fieldName, labelText) {
   const fieldBlock = document.createElement('div');
   fieldBlock.className = 'crocido-field-selector';
   fieldBlock.innerHTML = `
-    <label for="xpath-${fieldName}">${labelText}:</label>
-    <input type="text" id="xpath-${fieldName}" data-field="${fieldName}" readonly placeholder="XPath for ${labelText}">
-    <button class="crocido-select-field-btn crocido-btn crocido-btn-sm" data-field="${fieldName}">Select ${labelText}</button>
+    <label for="crocido-xpath-${fieldName}">${labelText} XPath:</label> 
+    <input type="text" id="crocido-xpath-${fieldName}" name="crocido-xpath-${fieldName}" style="width: 100%; margin-bottom: 5px;" placeholder="Relative XPath to ${labelText}">
+    <button class="crocido-select-field-btn crocido-btn crocido-btn-sm" data-field="${fieldName}">Auto-Select ${labelText}</button>
     <button class="crocido-clear-field-btn crocido-btn crocido-btn-sm crocido-btn-link" data-field="${fieldName}" disabled>Clear</button>
   `;
 
+  const xpathInput = fieldBlock.querySelector(`#crocido-xpath-${fieldName}`);
+  xpathInput.addEventListener('change', (event) => {
+    const fieldKey = fieldName; // fieldName is in scope here
+    if (predefinedFieldSelectors[fieldKey]) {
+      predefinedFieldSelectors[fieldKey].xpath = event.target.value;
+      console.log(`[Crocido] Manually updated XPath for ${fieldKey} to: ${event.target.value}`);
+      updateFieldSelectorBlockUI(fieldKey); // Update button states, etc.
+    }
+  });
+
   fieldBlock.querySelector('.crocido-select-field-btn').addEventListener('click', (event) => {
     currentFieldSelectionMode = event.target.dataset.field;
-    isSelectingPaginationElement = false; // Not selecting pagination if selecting a field
-    alert(`Click on the ${labelText} within one of the product containers.`);
-    // Highlight containers to guide user where to click
-    if(detectedProductContainerXPath) previewProductContainers(detectedProductContainerXPath);
-
+    isSelectingPaginationElement = false; // Ensure this is reset
+    // productContainerSelectionMode = false; // Ensure this is reset
+    alert(`Click on the ${labelText} within one of the product containers to attempt auto-selection.\nOr, you can manually edit the XPath above.`);
+    if(detectedProductContainerXPath) {
+        previewProductContainers(detectedProductContainerXPath); // Highlight containers to guide user
+    } else {
+        alert("Please define and preview Product Containers first so field selection can be relative.");
+    }
   });
 
   fieldBlock.querySelector('.crocido-clear-field-btn').addEventListener('click', (event) => {
     const fieldKey = event.target.dataset.field;
-    // Check if it's a predefined or custom field to update the correct object
     if (predefinedFieldSelectors[fieldKey]) {
         predefinedFieldSelectors[fieldKey].xpath = '';
-    } else if (customFieldSelectors[fieldKey]) {
-        // For custom fields, clearing means removing it entirely
-        delete customFieldSelectors[fieldKey];
-        // Remove the field block from the UI
-        event.target.closest('.crocido-field-selector').remove(); 
-        // If we remove the block, no need to call updateFieldSelectorBlockUI for this field
-        // However, we might need to update the main config object if it was saved there
-        const fieldIndexInConfig = currentConfigFromUI.selectors.findIndex(s => s.id === fieldKey);
-        if (fieldIndexInConfig > -1) {
-            currentConfigFromUI.selectors.splice(fieldIndexInConfig, 1);
-        }
-        return; // Exit early as the block is removed
+        xpathInput.value = ''; // Clear the input field
     }
     updateFieldSelectorBlockUI(fieldKey);
   });
@@ -702,28 +839,31 @@ function createFieldSelectorBlock(fieldName, labelText) {
 
 function updateFieldSelectorBlockUI(fieldName) {
   if (!setupSidebar) return;
-  const input = setupSidebar.querySelector(`#xpath-${fieldName}`);
   const selectBtn = setupSidebar.querySelector(`.crocido-select-field-btn[data-field="${fieldName}"]`);
   const clearBtn = setupSidebar.querySelector(`.crocido-clear-field-btn[data-field="${fieldName}"]`);
+  const xpathInput = setupSidebar.querySelector(`#crocido-xpath-${fieldName}`);
 
-  // Determine if it's a predefined or custom field
-  let fieldData = predefinedFieldSelectors[fieldName] || customFieldSelectors[fieldName];
+  let fieldData = predefinedFieldSelectors[fieldName];
 
-  if (input && fieldData) {
-    input.value = fieldData.xpath || '';
+  if (selectBtn && clearBtn && xpathInput && fieldData) {
+    xpathInput.value = fieldData.xpath || ''; // Populate input with current XPath
+
     if (fieldData.xpath) {
-      selectBtn.disabled = true; // Or change text to "Reselect"
+      // selectBtn.disabled = true; // Keep select active for re-selection attempt
+      selectBtn.textContent = `Attempt Re-Select ${fieldData.name}`;
       clearBtn.disabled = false;
     } else {
-      selectBtn.disabled = false;
+      // selectBtn.disabled = false;
+      selectBtn.textContent = `Auto-Select ${fieldData.name}`;
       clearBtn.disabled = true;
     }
-  } else if (!fieldData && input) {
-      // This case might happen if a custom field was just cleared and its block removed.
-      // If the block wasn't removed (e.g. error or different logic), ensure UI is clear.
-      input.value = '';
-      if(selectBtn) selectBtn.disabled = false;
-      if(clearBtn) clearBtn.disabled = true;
+  } else if (selectBtn && clearBtn && xpathInput && !fieldData) { // Should not happen if predefinedFieldSelectors is correct
+      // selectBtn.disabled = false;
+      clearBtn.disabled = true;
+      if (predefinedFieldSelectors[fieldName]) { // Check again, though condition implies it's false
+        selectBtn.textContent = `Auto-Select ${predefinedFieldSelectors[fieldName].name}`;
+      }
+      xpathInput.value = '';
   }
 }
 
@@ -731,49 +871,68 @@ function updateAllFieldSelectorBlocksUI() {
     Object.keys(predefinedFieldSelectors).forEach(fieldName => {
         updateFieldSelectorBlockUI(fieldName);
     });
-    Object.keys(customFieldSelectors).forEach(fieldName => {
-        updateFieldSelectorBlockUI(fieldName);
-    });
 }
 
-function handlePaginationMethodChange(event) {
+function handlePaginationMethodButtonClick(event) {
   if (!setupSidebar) return;
-  const selectedMethod = event.target.value;
+  const selectedMethod = event.target.dataset.method;
+  currentConfigFromUI.paginationMethod = selectedMethod;
+
+  // Update button active states
+  document.querySelectorAll('#crocido-pagination-options button').forEach(button => {
+    if (button.dataset.method === selectedMethod) {
+      button.classList.add('crocido-btn-active');
+    } else {
+      button.classList.remove('crocido-btn-active');
+    }
+  });
+
   const paginationSelectorSection = document.getElementById('crocido-pagination-selector-section');
   const xhrPatternsSection = document.getElementById('crocido-xhr-patterns-section');
+  const selectPaginationElementButton = document.getElementById('crocido-select-pagination-element');
 
   if (selectedMethod === 'nextButton' || selectedMethod === 'loadMoreButton') {
     paginationSelectorSection.style.display = 'block';
     xhrPatternsSection.style.display = 'none';
-    if (currentConfigFromUI) currentConfigFromUI.paginationMethod = selectedMethod;
+    // Prompt to select element, this button itself is for selection
+    document.getElementById('crocido-status-message').textContent = `Pagination: ${selectedMethod}. Click 'Select Pagination Element'.`;
+    selectPaginationElementButton.textContent = `Select ${selectedMethod === 'nextButton' ? 'Next Button' : 'Load More Button'}`;
   } else if (selectedMethod === 'xhrInfinite') {
     paginationSelectorSection.style.display = 'none';
     xhrPatternsSection.style.display = 'block';
-    if (currentConfigFromUI) currentConfigFromUI.paginationMethod = selectedMethod;
-    // Start XHR detection if not already active and this method is chosen
-    // startXhrDetection(); // This is called globally when setup mode starts
-    renderDetectedXhrPatterns(); // Re-render if switching to this view
+    document.getElementById('crocido-status-message').textContent = "Pagination: XHR/Infinite Scroll. Patterns will be detected.";
+    renderDetectedXhrPatterns(); 
   } else { // 'none'
     paginationSelectorSection.style.display = 'none';
     xhrPatternsSection.style.display = 'none';
-    if (currentConfigFromUI) currentConfigFromUI.paginationMethod = selectedMethod;
+    document.getElementById('crocido-status-message').textContent = "Pagination: None.";
   }
+  // Persist the change immediately to currentConfigFromUI for this part
+    if (currentConfigFromUI) currentConfigFromUI.paginationMethod = selectedMethod;
 }
 
 function renderPaginationMethod() {
   if (!setupSidebar || !currentConfigFromUI) return;
   const method = currentConfigFromUI.paginationMethod || 'none';
-  const radioToCheck = document.querySelector(`input[name="paginationMethod"][value="${method}"]`);
-  if (radioToCheck) {
-    radioToCheck.checked = true;
-    // Manually trigger the change handler to update UI sections visibility
-    handlePaginationMethodChange({ target: radioToCheck });
+  
+  document.querySelectorAll('#crocido-pagination-options button').forEach(button => {
+    if (button.dataset.method === method) {
+      button.classList.add('crocido-btn-active');
+    } else {
+      button.classList.remove('crocido-btn-active');
+    }
+  });
+
+  // Manually trigger the handler to update UI sections visibility and other details
+  const activeButton = document.querySelector(`#crocido-pagination-options button[data-method="${method}"]`);
+  if (activeButton) {
+    handlePaginationMethodButtonClick({ target: activeButton }); 
   }
-  // Ensure details (like selected XPath) are also rendered if applicable
+
   const paginationElementXpathDisplay = document.getElementById('crocido-pagination-element-xpath');
   if (paginationElementXpathDisplay && currentConfigFromUI.paginationDetails) {
     if (method === 'nextButton' || method === 'loadMoreButton') {
-        paginationElementXpathDisplay.textContent = currentConfigFromUI.paginationDetails.selector || '';
+        paginationElementXpathDisplay.textContent = currentConfigFromUI.paginationDetails.selector || 'No element selected';
     } else {
         paginationElementXpathDisplay.textContent = '';
     }
@@ -818,10 +977,12 @@ function renderDetectedXhrPatterns() {
 
 // Event handler for mouseover to show highlighter and tooltip
 function handleMouseOver(event) {
+  console.log(`[Crocido handleMouseOver] Active: ${isSetupModeActive}, PC Mode: ${productContainerSelectionMode}, Target not sidebar: ${!(setupSidebar && setupSidebar.contains(event.target))}`);
   if (!isSetupModeActive || (setupSidebar && setupSidebar.contains(event.target))) {
     return;
   }
   const element = event.target;
+  console.log("[Crocido handleMouseOver] Showing highlighter for:", element);
   showHighlighter(element);
   // showTooltip(element, getXPath(element)); // Tooltip can be noisy, optional
 }
@@ -835,77 +996,132 @@ function handleMouseOut(event) {
 
 // Main click handler - MODIFIED for relative field XPaths
 function handleClick(event) {
-  if (!isSetupModeActive || (setupSidebar && setupSidebar.contains(event.target))) {
+  console.log(`[Crocido handleClick Start] Active: ${isSetupModeActive}, PC Mode: ${productContainerSelectionMode}, Field Mode: ${currentFieldSelectionMode}, Target in sidebar: ${setupSidebar && setupSidebar.contains(event.target)}`);
+  if (!isSetupModeActive) return;
+
+  // Prevent click from propagating to elements underneath setup UI
+  if (setupSidebar && setupSidebar.contains(event.target)) {
     return;
   }
+
   event.preventDefault();
   event.stopPropagation();
 
-  const clickedElement = event.target;
-  hideHighlighter();
+  const targetElement = event.target;
+  hideHighlighter(); // Hide previous highlight
+  showHighlighter(targetElement); // Highlight the new one
 
-  if (productContainerSelectionMode) {
-    const xpath = getXPath(clickedElement); // Absolute XPath for containers
-    console.log("[Crocido] Clicked element XPath for Container Selection:", xpath);
-    if (!selectedContainerXPaths.includes(xpath)) {
-      selectedContainerXPaths.push(xpath);
-      const tempHighlight = document.createElement('div');
-      tempHighlight.className = 'crocido-temp-container-selection-highlight';
-      document.body.appendChild(tempHighlight);
-      const rect = clickedElement.getBoundingClientRect();
-      Object.assign(tempHighlight.style, {
-          position: 'absolute',
-          left: rect.left + window.scrollX + 'px',
-          top: rect.top + window.scrollY + 'px',
-          width: rect.width + 'px',
-          height: rect.height + 'px',
-          backgroundColor: 'rgba(255, 165, 0, 0.3)',
-          border: '2px solid orange',
-          zIndex: '9998',
-          pointerEvents: 'none'
-      });
-      setTimeout(() => tempHighlight.remove(), 1200);
+  if (productContainerSelectionMode === 'awaitingFirstContainer') {
+    firstSelectedContainerXPath = getXPath(targetElement);
+    firstSelectedContainerElement = targetElement; // ADDED: Store the DOM element
+    console.log(`[Crocido] First product container selected: ${firstSelectedContainerXPath}`, firstSelectedContainerElement);
+    // Highlight this first selection semi-permanently (or differently)
+    // For now, the general highlighter will move, which is okay.
+    // We need a way to visually distinguish the first selected container or keep its highlight.
+    // Consider adding to containerPreviewHighlighters here with a special style.
+    
+    // Preview this single selection
+    clearContainerPreviewHighlighters(); // Clear previous multi-previews
+    const tempHighlighter = document.createElement('div');
+    const rect = targetElement.getBoundingClientRect();
+    Object.assign(tempHighlighter.style, {
+        position: 'fixed',
+        left: `${rect.left + window.scrollX}px`,
+        top: `${rect.top + window.scrollY}px`,
+        width: `${rect.width}px`,
+        height: `${rect.height}px`,
+        backgroundColor: 'rgba(0, 255, 0, 0.3)', // Greenish for first selection
+        border: '2px solid green',
+        zIndex: '9998',
+        pointerEvents: 'none'
+    });
+    document.body.appendChild(tempHighlighter);
+    containerPreviewHighlighters.push(tempHighlighter);
 
-      if (selectedContainerXPaths.length === 2) {
-        detectedProductContainerXPath = generalizeProductContainerXPaths(selectedContainerXPaths[0], selectedContainerXPaths[1]);
-        console.log("[Crocido] Detected Product Container XPath from generalization:", detectedProductContainerXPath);
-        if (detectedProductContainerXPath) {
-            productContainerSelectionMode = false;
-        }
-      }
-    }
+
+    productContainerSelectionMode = 'awaitingSecondContainer';
     updateContainerDetectionUI();
-    previewProductContainers(detectedProductContainerXPath || (selectedContainerXPaths.length > 0 ? selectedContainerXPaths[selectedContainerXPaths.length -1] : null) );
+    showTooltip(targetElement, `1st: ${firstSelectedContainerXPath}. Now click a SECOND product container.`);
+    return; // Wait for the second click
+  } else if (productContainerSelectionMode === 'awaitingSecondContainer') {
+    if (!firstSelectedContainerXPath) {
+      console.error("[Crocido] Cannot select second container, first was not selected.");
+      showTooltip(targetElement, "Error: Select the first container again.");
+      // Optionally reset to awaitingFirstContainer
+      // productContainerSelectionMode = 'awaitingFirstContainer'; 
+      // updateContainerDetectionUI();
+      return;
+    }
+    const secondSelectedContainerElement = targetElement; // Get the second element
+    console.log(`[Crocido] Second product container selected:`, secondSelectedContainerElement);
+    
+    // Highlight the second selection too
+    const tempHighlighter = document.createElement('div');
+    const rect = targetElement.getBoundingClientRect();
+    Object.assign(tempHighlighter.style, {
+        position: 'fixed',
+        left: `${rect.left + window.scrollX}px`,
+        top: `${rect.top + window.scrollY}px`,
+        width: `${rect.width}px`,
+        height: `${rect.height}px`,
+        backgroundColor: 'rgba(0, 200, 255, 0.3)', // Bluish for second selection
+        border: '2px solid blue',
+        zIndex: '9998',
+        pointerEvents: 'none'
+    });
+    document.body.appendChild(tempHighlighter);
+    containerPreviewHighlighters.push(tempHighlighter);
 
-  } else if (isSelectingPaginationElement) { // Keep this variable separate from currentFieldSelectionMode
-    const xpath = getXPath(clickedElement);
-    console.log("[Crocido] Clicked element XPath for Pagination:", xpath);
-    currentConfigFromUI.paginationDetails.selector = xpath;
-    const paginationElementXpathDisplay = document.getElementById('crocido-pagination-element-xpath');
-    if (paginationElementXpathDisplay) paginationElementXpathDisplay.textContent = xpath;
-    alert(`Pagination element XPath set to: ${xpath}`);
-    isSelectingPaginationElement = false;
-    showSetupSidebarFromTemporaryHide();
-
+    detectedProductContainerXPath = generalizeProductContainerXPaths(firstSelectedContainerElement, secondSelectedContainerElement); 
+    
+    if (detectedProductContainerXPath) {
+      currentConfigFromUI.productContainersXpath = detectedProductContainerXPath;
+      console.log(`[Crocido] Generalized Product Container XPath: ${detectedProductContainerXPath}`);
+      showTooltip(targetElement, `Generalized: ${detectedProductContainerXPath}`);
+      // Preview the generalized XPath immediately
+      previewProductContainers(detectedProductContainerXPath); 
+    } else {
+      console.warn("[Crocido] Failed to generalize product container XPath. Using fallback or none.");
+      // Keep specific selections for now or fallback (findCommonAncestorXPath might already be doing this)
+      // For simplicity, if generalizeProductContainerXPaths returns null/undefined, we might indicate failure.
+      // currentConfigFromUI.productContainersXpath = firstSelectedContainerXPath; // Or some fallback
+      showTooltip(targetElement, "Could not generalize. Try different pair or check console.");
+    }
+    productContainerSelectionMode = false; // End selection mode for containers
+    firstSelectedContainerXPath = null; // Clear for next attempt
+    firstSelectedContainerElement = null; // ADDED: Clear the stored element
+    updateContainerDetectionUI(); // Update UI with the new XPath or status
+    return; 
   } else if (currentFieldSelectionMode) { 
     let fieldObject;
     let fieldKey = currentFieldSelectionMode; 
 
     if (predefinedFieldSelectors[fieldKey]) {
         fieldObject = predefinedFieldSelectors[fieldKey];
-    } else if (customFieldSelectors[fieldKey]) {
-        fieldObject = customFieldSelectors[fieldKey];
     }
 
     if (fieldObject) {
         let finalXpathToStore = null;
+        let clickedElementForXPath = targetElement; // Element to base XPath generation on
+
+        if (fieldKey === 'Link') {
+            const anchorParent = targetElement.closest('a');
+            if (anchorParent) {
+                console.log("[Crocido] Link selection: Found parent anchor:", anchorParent);
+                clickedElementForXPath = anchorParent; // Use the anchor itself for XPath
+                // We'll get the relative XPath to this anchor, and scraper engine will get href
+            } else {
+                console.warn("[Crocido] Link selection: No parent anchor found for clicked element. Using clicked element directly.");
+            }
+        }
+
         if (detectedProductContainerXPath) {
             let parentContainerElement = null;
             try {
                 const containerNodes = document.evaluate(detectedProductContainerXPath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
                 for (let i = 0; i < containerNodes.snapshotLength; i++) {
                     const containerInstance = containerNodes.snapshotItem(i);
-                    if (containerInstance.contains(clickedElement)) {
+                    if (containerInstance.contains(targetElement)) {
                         parentContainerElement = containerInstance;
                         break;
                     }
@@ -921,12 +1137,32 @@ function handleClick(event) {
                 previewProductContainers(detectedProductContainerXPath);
                 return;
             }
-            finalXpathToStore = getXPath(clickedElement, parentContainerElement);
-            console.log(`[Crocido] Relative XPath for ${fieldObject.name}: ${finalXpathToStore}`);
+            // Generate XPath for clickedElementForXPath (which might be the anchor for Link)
+            finalXpathToStore = getXPath(clickedElementForXPath, parentContainerElement); 
+            
+            // If it's a Link, and we used an anchor, ensure it captures the href intent
+            // The scraper engine handles getting .href, so the XPath just needs to point to the <a>
+            if (fieldKey === 'Link' && clickedElementForXPath.tagName === 'A') {
+                 // No specific change to finalXpathToStore needed here for /@href, 
+                 // as scraper_engine/main.js extractFieldData is now designed to get .href
+                 // from an element if fieldType/name is 'Link'.
+                 console.log(`[Crocido] Relative XPath for Link (anchor tag): ${finalXpathToStore}`);
+            } else {
+                 console.log(`[Crocido] Relative XPath for ${fieldObject.name}: ${finalXpathToStore}`);
+            }
+
         } else {
-            finalXpathToStore = getXPath(clickedElement);
-            console.warn(`[Crocido] No product container defined. Storing absolute XPath for ${fieldObject.name}: ${finalXpathToStore}`);
-            alert("Warning: No product container is defined. The XPath for this field will be absolute and might not work well for multiple items.");
+            // If no container, get direct XPath. For Link, if it's an anchor, point to it.
+            if (fieldKey === 'Link' && clickedElementForXPath.tagName === 'A') {
+                finalXpathToStore = getXPath(clickedElementForXPath); 
+                // Again, scraper engine handles .href extraction.
+                console.warn(`[Crocido] No product container. Absolute XPath for Link (anchor): ${finalXpathToStore}`);
+                alert("Warning: No product container. Storing absolute XPath for Link. This might not work well for multiple items.");
+            } else {
+                finalXpathToStore = getXPath(clickedElementForXPath);
+                console.warn(`[Crocido] No product container defined. Storing absolute XPath for ${fieldObject.name}: ${finalXpathToStore}`);
+                alert("Warning: No product container is defined. The XPath for this field will be absolute and might not work well for multiple items.");
+            }
         }
 
         fieldObject.xpath = finalXpathToStore;
@@ -955,154 +1191,375 @@ function destroySetupUI() {
     tooltip = null;
   }
   clearContainerPreviewHighlighters();
-  stopXhrDetection(); // Stop XHR monitoring
+  // stopXhrDetection(); // Stop XHR monitoring - Removed as function is not defined
 }
 
-// Main function to toggle setup mode
-function toggleSetupMode(isActive) {
-  console.log(`[Crocido] toggleSetupMode called with isActive: ${isActive}`); // Ensure this log is present
-  isSetupModeActive = isActive;
-  if (isSetupModeActive) {
-    createSetupUI();
+// Main function to toggle setup mode and manage UI elements
+function toggleSetupMode(isActive, configToLoad = null) {
+  console.log(`[Crocido] toggleSetupMode called. isActive: ${isActive}. Config provided:`, configToLoad ? JSON.parse(JSON.stringify(configToLoad)) : 'None');
+  if (isActive) {
+    isSetupModeActive = true;
+    createSetupUI(); // Creates the basic structure of the sidebar
+    if (configToLoad) {
+      console.log("[Crocido] toggleSetupMode: Loading specific config into UI:", configToLoad);
+      loadConfigIntoUI(configToLoad); // Load the provided config into the UI elements
+    } else {
+      // If no specific config is passed, loadConfigIntoUI(null) handles creating/displaying a new default state.
+      console.log("[Crocido] toggleSetupMode: No specific config provided, loading default state via loadConfigIntoUI(null).");
+      loadConfigIntoUI(null); 
+    }
     document.addEventListener('mouseover', handleMouseOver);
     document.addEventListener('mouseout', handleMouseOut);
     document.addEventListener('click', handleClick, true); // Use capture phase for click
-    // startXhrDetection(); // Ensure this line is REMOVED or commented out
+    console.log("[Crocido] Setup mode activated. Event listeners added.");
   } else {
-    destroySetupUI();
+    isSetupModeActive = false;
+    destroySetupUI(); // Removes UI and cleans up
     document.removeEventListener('mouseover', handleMouseOver);
     document.removeEventListener('mouseout', handleMouseOut);
     document.removeEventListener('click', handleClick, true);
-    // stopXhrDetection(); // Ensure this line is REMOVED or commented out
-    // Reset states
+    // Reset critical state variables
     productContainerSelectionMode = false;
     selectedContainerXPaths = [];
     detectedProductContainerXPath = null;
     currentFieldSelectionMode = null;
     isSelectingPaginationElement = false;
+    // currentConfigFromUI = {}; // Optionally clear or reset currentConfigFromUI to a default state
+    console.log("[Crocido] Setup mode deactivated. Event listeners removed and UI destroyed.");
   }
 }
 
-// COMBINED_MESSAGE_LISTENER_START
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  console.log("[Crocido] Message received in content_script:", message.action, "Sender origin:", sender.origin, "Sender tab:", sender.tab ? sender.tab.id : "N/A");
+// Event listener for messages from the popup or background script
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  console.log("[Crocido Content Script] Received message - Action:", request.action, "Sender Tab ID:", sender.tab ? sender.tab.id : "N/A", "Request Data:", request);
 
-  // Actions from the original first listener (around line 763)
-  if (message.action === "startSetup") {
-    // Expect this from popup (no sender.tab) or specific extension ID
-    if (!sender.tab) { 
-      console.log("[Crocido] Handling startSetup action from popup/extension.");
-      toggleSetupMode(true);
-      sendResponse({ status: "Setup mode activated in content script." });
+  if (request.action === "startSetup") {
+    // This message now comes from the background script (main.js) and includes the config
+    console.log("[Crocido Content Script] 'startSetup' action received.");
+    if (request.config) {
+      console.log("[Crocido Content Script] Config received with startSetup for domain:", request.config.domain, JSON.parse(JSON.stringify(request.config)));
+      toggleSetupMode(true, request.config); // Activate setup UI and load the provided config
+      sendResponse({status: "Setup UI activated with received config.", loadedDomain: request.config.domain});
     } else {
-      // console.warn("[Crocido] startSetup message received from a tab. If intended, review sender logic.");
-      // Potentially allow if it's from own extension tab? For now, strict to non-tab senders for popup.
-      sendResponse({ status: "startSetup ignored, sender was a tab."});
+      // Fallback if, for some reason, config is missing. Should ideally not happen with new flow.
+      console.warn("[Crocido Content Script] 'startSetup' received WITHOUT a config. This is unexpected. Initializing default for current page.");
+      toggleSetupMode(true); // Activate setup mode; toggleSetupMode will call loadConfigIntoUI(null)
+      sendResponse({status: "Setup UI activated (no specific config provided, using default)."});
     }
-  } else if (message.action === "cancelSetup") {
-    if (!sender.tab) {
-      console.log("[Crocido] Handling cancelSetup action from popup/extension.");
+    return true; // Indicate response may be asynchronous or to keep channel open
+
+  } else if (request.action === "stopSetup") { // Could be triggered by a 'cancel' or 'close' from popup/background
+    console.log("[Crocido Content Script] 'stopSetup' action received.");
       toggleSetupMode(false);
-      sendResponse({ status: "Setup mode deactivated." });
-    }
-  } else if (message.action === "getConfigurationForCurrentTab") {
-    console.log("[Crocido] Handling getConfigurationForCurrentTab action.");
-    if (isSetupModeActive && detectedProductContainerXPath && Object.values(predefinedFieldSelectors).some(s => s.xpath)) {
-        const configNameInput = document.getElementById('crocido-config-name');
-        const configName = configNameInput ? configNameInput.value : "Auto Config";
-        const domain = window.location.hostname;
-        const finalSelectors = Object.values(predefinedFieldSelectors).filter(s => s.xpath);
-        const paginationMethodRadio = document.querySelector('input[name="paginationMethod"]:checked');
-        const paginationMethodValue = paginationMethodRadio ? paginationMethodRadio.value : "none";
-        let paginationDetailsValue = {};
+    sendResponse({status: "Setup UI deactivated."});
+    // No return true needed if response is immediate and channel can close.
 
-        if (paginationMethodValue === 'nextButton' || paginationMethodValue === 'loadMoreButton') {
-            const paginationElementXpathEl = document.getElementById('crocido-pagination-element-xpath');
-            if (paginationElementXpathEl) paginationDetailsValue.selector = paginationElementXpathEl.textContent;
-        } else if (paginationMethodValue === 'xhrInfinite') {
-             paginationDetailsValue.xhrPatterns = currentConfigFromUI.detectedXhrPatterns || [];
-        }
-
-        sendResponse({
-            configName: configName,
-            domain: domain,
-            productContainersXpath: detectedProductContainerXPath,
-            selectors: finalSelectors,
-            paginationMethod: paginationMethodValue,
-            paginationDetails: paginationDetailsValue,
-            detectedXhrPatterns: currentConfigFromUI.detectedXhrPatterns || [],
-            status: "Configuration available"
-        });
-    } else {
-        sendResponse({ status: "Configuration not ready or setup not active." });
-    }
-  // Actions from the original second listener (around line 1109)
-  } else if (message.action === "activateSetupMode") { 
-    console.log("[Crocido] Handling activateSetupMode action (ensure this is not clashing with 'startSetup').");
-    // This seems redundant if popup sends "startSetup". Consider merging or ensuring distinct use cases.
-    isSetupModeActive = true;
-    createSetupUI();
-    sendResponse({status: "Setup mode activated via activateSetupMode"});
-  } else if (message.action === "deactivateSetupMode") {
-    console.log("[Crocido] Handling deactivateSetupMode action.");
-    isSetupModeActive = false;
-    destroySetupUI();
-    sendResponse({status: "Setup mode deactivated via deactivateSetupMode"});
-  } else if (message.action === "updateCurrentConfig") { 
-    console.log("[Crocido] Handling updateCurrentConfig action.");
-    if (message.config) {
-      console.log("Content script received 'updateCurrentConfig' from background:", message.config);
-      currentConfigFromUI = JSON.parse(JSON.stringify(message.config)); 
+  } else if (request.action === "updateCurrentConfig") { // If background pushes an updated config (e.g., after a save)
+    console.log("[Crocido Content Script] 'updateCurrentConfig' action received.");
+    if (request.config) {
+      console.log("Content script received 'updateCurrentConfig' from background:", JSON.parse(JSON.stringify(request.config)));
+      currentConfigFromUI = JSON.parse(JSON.stringify(request.config)); // Update the global working copy
       if (isSetupModeActive && setupSidebar) {
-         loadConfigIntoUI(currentConfigFromUI); 
+         loadConfigIntoUI(currentConfigFromUI); // Re-load into the active UI
       }
-      sendResponse({status: "Content script currentConfig updated"});
+      sendResponse({status: "Content script currentConfig updated and UI refreshed if active.", updatedDomain: request.config.domain });
     } else {
+      console.error("[Crocido Content Script] Error: No config provided in updateCurrentConfig");
       sendResponse({status: "Error: No config provided in updateCurrentConfig", error: true});
     }
-  } else if (message.action === "categoryDetectionComplete") { 
-    console.log("[Crocido] Handling categoryDetectionComplete action.");
-    if (message.detectedUrls && message.detectedUrls.length > 0) {
-      message.detectedUrls.forEach(url => { 
+    return true; // Indicate async response may be used.
+
+  } else if (request.action === "categoryDetectionComplete") {
+    console.log("[Crocido Content Script] 'categoryDetectionComplete' received from:", request.source, "Type:", request.detectionType);
+    console.log("[Crocido Content Script] Detected URLs:", request.detectedUrls);
+    if (request.detectedUrls && Array.isArray(request.detectedUrls)) {
+        request.detectedUrls.forEach(url => {
         if (!detectedCategoryUrlsFromSitemap.includes(url)) {
           detectedCategoryUrlsFromSitemap.push(url);
         }
       });
-      updateDetectedCategoryListUI();
-    }
-    const detectButton = document.getElementById('crocido-detect-categories-sitemap'); 
-    if (detectButton) detectButton.disabled = false;
-    
-    const statusMsgEl = document.getElementById('crocido-status-message');
-    if (statusMsgEl) {
-      let messageText = "Found ";
-      if (message.detectedUrls) {
-        messageText += message.detectedUrls.length;
+        updateDetectedCategoryListUI(); // Update the UI with the new list
+        if (setupSidebar) {
+            const msgElement = setupSidebar.querySelector('#crocido-category-detection-message');
+            if (msgElement) {
+                msgElement.textContent = `${request.detectedUrls.length} URLs from ${request.detectionType} added. Total detected: ${detectedCategoryUrlsFromSitemap.length}.`;
+                setTimeout(() => { if(msgElement) msgElement.textContent = ''; }, 5000);
+            }
+        }
+        sendResponse({status: "Category URLs updated in UI", count: detectedCategoryUrlsFromSitemap.length});
       } else {
-        messageText += "0";
-      }
-      messageText += " categories via " + message.detectionType + ".";
-      statusMsgEl.textContent = messageText;
+        sendResponse({status: "No new category URLs provided or data was not an array.", count: detectedCategoryUrlsFromSitemap.length});
     }
-  } else if (message.action === "xhrPatternDetectedForUI") { 
-    console.log("[Crocido] Handling xhrPatternDetectedForUI action.");
-    if (message.pattern && isSetupModeActive && setupSidebar) {
+    // Re-enable button in UI if it was disabled during detection
+    const detectButton = setupSidebar ? setupSidebar.querySelector('#crocido-detect-sitemap-categories') : null; // Ensure correct ID
+    if(detectButton) detectButton.disabled = false;
+    return true; // Keep channel open as UI updates might be considered async by caller
+
+  } else if (request.action === "xhrPatternDetectedForUI") { 
+    console.log("[Crocido Content Script] 'xhrPatternDetectedForUI' action received.", request.pattern);
+    if (request.pattern && isSetupModeActive && setupSidebar) {
         if (!currentConfigFromUI.detectedXhrPatterns) {
             currentConfigFromUI.detectedXhrPatterns = [];
         }
-        if (!currentConfigFromUI.detectedXhrPatterns.some(p => p.url === message.pattern.url && p.method === message.pattern.method)) {
-            currentConfigFromUI.detectedXhrPatterns.push(message.pattern);
-            renderDetectedXhrPatterns(); 
+        // Ensure pattern is an object with url and method
+        if (request.pattern.url && request.pattern.method && !currentConfigFromUI.detectedXhrPatterns.some(p => p.url === request.pattern.url && p.method === request.pattern.method)) {
+            currentConfigFromUI.detectedXhrPatterns.push(request.pattern);
+            renderDetectedXhrPatterns(); // Update the UI to show the new pattern
+            sendResponse({status: "XHR pattern added and UI updated.", pattern: request.pattern});
+        } else {
+            sendResponse({status: "XHR pattern already exists or invalid.", pattern: request.pattern});
         }
+    } else {
+         sendResponse({status: "XHR pattern not processed; setup not active or pattern missing.", error: true});
     }
-    sendResponse({status: "XHR pattern noted by UI."});
+    return true;
+
+  } else if (request.action === "executeLocalScrape") {
+    console.log("[Crocido Content Script] 'executeLocalScrape' action received with config:", JSON.parse(JSON.stringify(request.config)));
+    const config = request.config;
+    if (!config || !config.productContainersXpath || !config.selectors || !Array.isArray(config.selectors)) {
+      console.error("Local scrape cannot proceed: Essential config details missing or selectors not an array.");
+      sendResponse({ success: false, error: "Essential configuration details missing or invalid for local scrape." });
+      return;
+    }
+
+    // Function to perform the actual scraping on the current page
+    async function performLocalScrape(currentConfig) {
+      let resultsArray = [];
+      console.log("[Crocido Local Scrape] Starting scrape with XPath:", currentConfig.productContainersXpath);
+
+      try {
+        const containerNodesSnapshot = document.evaluate(currentConfig.productContainersXpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        console.log("[Crocido Local Scrape] Found", containerNodesSnapshot.snapshotLength, "product containers.");
+
+        for (let i = 0; i < containerNodesSnapshot.snapshotLength; i++) {
+          const containerElement = containerNodesSnapshot.snapshotItem(i);
+          let item = {};
+          let allFieldsNullForThisItem = true; // Flag to check if we extracted any data for the item
+
+          for (const selector of currentConfig.selectors) {
+            let value = null;
+            if (containerElement && selector.xpath) {
+              try {
+                // Resolve XPath relative to the containerElement
+                const fieldElementSnapshot = document.evaluate(selector.xpath, containerElement, null, XPathResult.ANY_TYPE, null);
+                let fieldElement = fieldElementSnapshot.snapshotItem ? fieldElementSnapshot.snapshotItem(0) : fieldElementSnapshot.singleNodeValue;
+                
+                if(fieldElementSnapshot.resultType === XPathResult.NUMBER_TYPE) {
+                    value = fieldElementSnapshot.numberValue;
+                } else if (fieldElementSnapshot.resultType === XPathResult.STRING_TYPE) {
+                    value = fieldElementSnapshot.stringValue;
+                } else if (fieldElementSnapshot.resultType === XPathResult.BOOLEAN_TYPE) {
+                    value = fieldElementSnapshot.booleanValue;
   } else {
-    console.warn("[Crocido] Received unhandled message action in content script:", message.action);
-    sendResponse({status: "Unknown action in content script", error: true});
+                    // For snapshot types or single node value from ANY_TYPE if not primitive
+                    fieldElement = fieldElementSnapshot.singleNodeValue || (fieldElementSnapshot.snapshotItem && fieldElementSnapshot.snapshotItem(0));
+                }
+
+                if (fieldElement) {
+                  // Smartly get content based on field type or common patterns
+                  if (selector.fieldType && selector.fieldType.toLowerCase().includes('image') || selector.name.toLowerCase().includes('image')) {
+                    value = fieldElement.src || fieldElement.getAttribute('data-src') || fieldElement.href;
+                    // Ensure URL is absolute
+                    if (value && typeof value === 'string' && !value.startsWith('http')){
+                        try { value = new URL(value, window.location.href).href; } catch(e){ /* ignore if not valid relative */}
+                    }
+                  } else if (selector.fieldType && selector.fieldType.toLowerCase().includes('link') || selector.name.toLowerCase().includes('link')) {
+                    value = fieldElement.href;
+                    if (value && typeof value === 'string' && !value.startsWith('http')){
+                        try { value = new URL(value, window.location.href).href; } catch(e){}
+                    }
+                  } else {
+                    value = fieldElement.textContent;
+                  }
+                  if (value) value = value.trim();
+                }
+              } catch (e) {
+                console.warn(`[Crocido Local Scrape] Error evaluating XPath "${selector.xpath}" for field "${selector.name}" within a container:`, e);
+                value = null;
+              }
+            }
+            item[selector.name || selector.id || 'field_'+i] = value;
+            if (value !== null) {
+                allFieldsNullForThisItem = false;
+            }
+          }
+          if(!allFieldsNullForThisItem){
+             resultsArray.push(item);
+          }
+        }
+      } catch (e) {
+        console.error("[Crocido Local Scrape] Major error during XPath evaluation for containers or field extraction:", e);
+        // Send error back if a major issue occurs
+        sendResponse({ success: false, error: "Error during local scrape: " + e.message });
+        return; // Stop further execution in this function
+      }
+      
+      console.log("[Crocido Local Scrape] Scraping of current page complete. Items found:", resultsArray.length);
+      
+      // --- Pagination Logic Start ---
+      if (currentConfig.paginationMethod === 'nextButton' && currentConfig.paginationDetails && currentConfig.paginationDetails.selector) {
+        console.log("[Crocido Local Scrape] Next button pagination detected. Selector:", currentConfig.paginationDetails.selector);
+        let currentPage = 1; // Or 0 if you prefer 0-indexed
+        const maxPages = currentConfig.paginationDetails.maxPages || 5; // Default max pages to prevent infinite loops
+
+        while (currentPage < maxPages) {
+          const nextButton = getElementByXPath(currentConfig.paginationDetails.selector);
+          if (nextButton && !nextButton.disabled && nextButton.offsetParent !== null) { // Check if button exists, is enabled, and visible
+            console.log(`[Crocido Local Scrape] Clicking next button (Page ${currentPage + 1}).`);
+            nextButton.click();
+
+            // Wait for new content to load - this is a critical and potentially flaky part
+            // Option 1: Fixed delay (simple but unreliable)
+            await new Promise(resolve => setTimeout(resolve, currentConfig.paginationDetails.delay || 3000)); // Configurable delay
+            // Option 2: MutationObserver (more complex but robust - for future iteration if needed)
+
+            console.log("[Crocido Local Scrape] Scraping content after clicking next button...");
+            const nextPageContainerNodesSnapshot = document.evaluate(currentConfig.productContainersXpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            console.log("[Crocido Local Scrape] Found", nextPageContainerNodesSnapshot.snapshotLength, "product containers on new page section.");
+            let itemsFromNewPage = 0;
+            for (let i = 0; i < nextPageContainerNodesSnapshot.snapshotLength; i++) {
+              const containerElement = nextPageContainerNodesSnapshot.snapshotItem(i);
+              let item = {};
+              let allFieldsNullForThisItem = true;
+              for (const selector of currentConfig.selectors) {
+                let value = null;
+                if (containerElement && selector.xpath) {
+                  try {
+                    const fieldElementSnapshot = document.evaluate(selector.xpath, containerElement, null, XPathResult.ANY_TYPE, null);
+                    let fieldElement = fieldElementSnapshot.snapshotItem ? fieldElementSnapshot.snapshotItem(0) : fieldElementSnapshot.singleNodeValue;
+                    if(fieldElementSnapshot.resultType === XPathResult.NUMBER_TYPE) value = fieldElementSnapshot.numberValue;
+                    else if (fieldElementSnapshot.resultType === XPathResult.STRING_TYPE) value = fieldElementSnapshot.stringValue;
+                    else if (fieldElementSnapshot.resultType === XPathResult.BOOLEAN_TYPE) value = fieldElementSnapshot.booleanValue;
+                    else fieldElement = fieldElementSnapshot.singleNodeValue || (fieldElementSnapshot.snapshotItem && fieldElementSnapshot.snapshotItem(0));
+
+                    if (fieldElement) {
+                        if (selector.fieldType && selector.fieldType.toLowerCase().includes('image') || selector.name.toLowerCase().includes('image')) {
+                            value = fieldElement.src || fieldElement.getAttribute('data-src') || fieldElement.href;
+                            if (value && typeof value === 'string' && !value.startsWith('http')) try { value = new URL(value, window.location.href).href; } catch(e){}
+                        } else if (selector.fieldType && selector.fieldType.toLowerCase().includes('link') || selector.name.toLowerCase().includes('link')) {
+                            value = fieldElement.href;
+                            if (value && typeof value === 'string' && !value.startsWith('http')) try { value = new URL(value, window.location.href).href; } catch(e){}
+                        } else {
+                            value = fieldElement.textContent;
+                        }
+                        if (value) value = value.trim();
+                    }
+                  } catch (e) { console.warn(`[Crocido Local Scrape] Error on paginated field "${selector.name}":`, e); value = null; }
+                }
+                item[selector.name || selector.id || 'field_'+i] = value;
+                if (value !== null) allFieldsNullForThisItem = false;
+              }
+              if(!allFieldsNullForThisItem) {
+                resultsArray.push(item);
+                itemsFromNewPage++;
+              }
+            }
+            console.log("[Crocido Local Scrape] Added", itemsFromNewPage, "items from page/scroll", currentPage + 1);
+            if (itemsFromNewPage === 0 && nextPageContainerNodesSnapshot.snapshotLength > 0) {
+                // If containers were found but no data extracted, it might indicate end of unique items or issues with selectors on later items.
+                console.log("[Crocido Local Scrape] No new data extracted from visible containers on page", currentPage + 1, ". Might be end of unique items or selector issues.");
+            }
+            currentPage++;
+          } else {
+            console.log("[Crocido Local Scrape] Next button not found, disabled, or not visible. Ending pagination.");
+            break; // Exit loop if no next button
+          }
+        }
+      } else if (currentConfig.paginationMethod === 'loadMoreButton' && currentConfig.paginationDetails && currentConfig.paginationDetails.selector) {
+        // Similar logic for "Load More" - often the button stays the same and content appends.
+        // The main difference is that you might not need to re-evaluate *all* containers, 
+        // but only new ones, or re-evaluate all if structure is flat.
+        // For simplicity, we can re-evaluate all for now.
+        console.log("[Crocido Local Scrape] Load More button pagination detected. Selector:", currentConfig.paginationDetails.selector);
+        let clickCount = 0;
+        const maxClicks = currentConfig.paginationDetails.maxClicks || 5; // Default max clicks
+
+        while(clickCount < maxClicks) {
+            const loadMoreButton = getElementByXPath(currentConfig.paginationDetails.selector);
+            if (loadMoreButton && !loadMoreButton.disabled && loadMoreButton.offsetParent !== null) {
+                console.log(`[Crocido Local Scrape] Clicking load more button (Click ${clickCount + 1}).`);
+                loadMoreButton.click();
+                await new Promise(resolve => setTimeout(resolve, currentConfig.paginationDetails.delay || 3000));
+                
+                // Re-scrape the entire container list, assuming new items are added or existing list is replaced.
+                // A more optimized approach might identify only new items, but that's more complex.
+                // For now, let's clear results and re-populate to avoid duplicates if items are re-rendered.
+                // This is a simplification; a robust solution would handle merging or identifying new items.
+                console.log("[Crocido Local Scrape] Re-evaluating product containers after Load More click...");
+                // It's safer to assume a full re-scrape after load more and de-duplicate later if necessary,
+                // or ensure that the primary scraping logic only adds *new* items.
+                // For this iteration, we'll add all found items. Duplicates might occur if not handled by XPaths.
+                const loadMoreContainerNodes = document.evaluate(currentConfig.productContainersXpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                let itemsFromLoadMore = 0;
+                for (let i = 0; i < loadMoreContainerNodes.snapshotLength; i++) {
+                  const containerElement = loadMoreContainerNodes.snapshotItem(i);
+                  // Check if this container was already processed (simple check by content, very naive)
+                  // A more robust check would use unique IDs or more stable attributes if available.
+                  // For now, we risk duplicates to ensure all items are captured.
+                  let item = {};
+                  let allFieldsNullForThisItem = true;
+                  for (const selector of currentConfig.selectors) {
+                    let value = null;
+                    if (containerElement && selector.xpath) {
+                      try {
+                        const fieldElementSnapshot = document.evaluate(selector.xpath, containerElement, null, XPathResult.ANY_TYPE, null);
+                        let fieldElement = fieldElementSnapshot.snapshotItem ? fieldElementSnapshot.snapshotItem(0) : fieldElementSnapshot.singleNodeValue;
+                        if(fieldElementSnapshot.resultType === XPathResult.NUMBER_TYPE) value = fieldElementSnapshot.numberValue;
+                        else if (fieldElementSnapshot.resultType === XPathResult.STRING_TYPE) value = fieldElementSnapshot.stringValue;
+                        else if (fieldElementSnapshot.resultType === XPathResult.BOOLEAN_TYPE) value = fieldElementSnapshot.booleanValue;
+                        else fieldElement = fieldElementSnapshot.singleNodeValue || (fieldElementSnapshot.snapshotItem && fieldElementSnapshot.snapshotItem(0));
+
+                        if (fieldElement) {
+                            if (selector.fieldType && selector.fieldType.toLowerCase().includes('image') || selector.name.toLowerCase().includes('image')) {
+                                value = fieldElement.src || fieldElement.getAttribute('data-src') || fieldElement.href;
+                                if (value && typeof value === 'string' && !value.startsWith('http')) try { value = new URL(value, window.location.href).href; } catch(e){}
+                            } else if (selector.fieldType && selector.fieldType.toLowerCase().includes('link') || selector.name.toLowerCase().includes('link')) {
+                                value = fieldElement.href;
+                                if (value && typeof value === 'string' && !value.startsWith('http')) try { value = new URL(value, window.location.href).href; } catch(e){}
+                            } else {
+                                value = fieldElement.textContent;
+                            }
+                            if (value) value = value.trim();
+                        }
+                      } catch (e) { console.warn(`[Crocido Local Scrape] Error on loadMore field "${selector.name}":`, e); value = null; }
+                    }
+                    item[selector.name || selector.id || 'field_'+i] = value;
+                    if (value !== null) allFieldsNullForThisItem = false;
+                  }
+                  // To avoid duplicates with 'load more', we need a strategy.
+                  // Simplest: assume XPaths are stable and only add if not already present (very basic check based on stringifying item).
+                  // A proper de-duplication would require a unique key per item.
+                  const itemString = JSON.stringify(item); 
+                  if(!allFieldsNullForThisItem && !resultsArray.some(existingItem => JSON.stringify(existingItem) === itemString)){
+                     resultsArray.push(item);
+                     itemsFromLoadMore++;
+                  }
+                }
+                 console.log("[Crocido Local Scrape] Added/updated", itemsFromLoadMore, "items after Load More click", clickCount + 1);
+                 clickCount++;
+            } else {
+                console.log("[Crocido Local Scrape] Load More button not found, disabled, or not visible. Ending pagination.");
+                break;
+            }
+        }
+      }
+      // --- Pagination Logic End ---
+
+      console.log("[Crocido Local Scrape] Total items after pagination (if any):", resultsArray.length);
+      sendResponse({ success: true, data: resultsArray, message: "Local scrape (with pagination if applicable) complete." });
+    }
+
+    performLocalScrape(config); // Call the scraping function
+
+    return true; // Important: indicates asynchronous response as performLocalScrape calls sendResponse
+
+  } else {
+    console.warn("[Crocido Content Script] Received unhandled message action:", request.action);
+    sendResponse({status: "Unknown action in content script: " + request.action, error: true});
+    // No return true, let channel close unless a default async behavior is desired.
   }
-  return true; // Keep true for asynchronous responses from any branch
 });
-// COMBINED_MESSAGE_LISTENER_END
 
 // Add some basic CSS for highlighter and tooltip (can be moved to a CSS file)
 const styleElement = document.createElement('style');
@@ -1187,6 +1644,11 @@ styleElement.textContent = `
   .crocido-btn:disabled { background-color: #e9ecef; color: #6c757d; cursor: not-allowed; }
   .crocido-button-group { display: flex; margin-top: 5px; }
   .crocido-button-group .crocido-btn { flex-grow: 1; }
+  .crocido-button-group .crocido-btn.crocido-btn-active {
+    background-color: #0056b3; /* Darker blue for active state */
+    color: white;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
+  }
   .crocido-field-selector { margin-bottom: 10px; padding: 8px; background-color: #fff; border: 1px solid #e0e0e0; border-radius: 3px;}
   .crocido-field-selector label { display: block; margin-bottom: 3px; font-weight: bold; }
   #crocido-detected-xhr-patterns-display ul { list-style: none; padding-left: 0; font-size:0.85em; }
@@ -1224,204 +1686,191 @@ function updateManualCategoriesFromTextarea() {
 }
 
 async function saveCurrentConfig() {
-  // ...
-  const configName = document.getElementById('crocido-config-name') ? document.getElementById('crocido-config-name').value : "Untitled Config";
-  const domain = window.location.hostname;
-
-  let selectors = [];
-  // Add predefined fields
+  console.log("[Crocido] Attempting to save current config from UI.");
+  currentConfigFromUI.configName = document.getElementById('crocido-config-name')?.value || `Config ${Date.now()}`;
+  currentConfigFromUI.domain = window.location.hostname;
+  
+  currentConfigFromUI.selectors = [];
   Object.keys(predefinedFieldSelectors).forEach(fieldName => {
-    if (predefinedFieldSelectors[fieldName].xpath) { // Only save if an XPath is set
-      selectors.push({
-        id: fieldName, // Using the key as id
-        name: predefinedFieldSelectors[fieldName].name,
-        xpath: predefinedFieldSelectors[fieldName].xpath,
-        fieldType: predefinedFieldSelectors[fieldName].name // for backward compatibility or specific handling
-      });
+    const field = predefinedFieldSelectors[fieldName];
+    const xpathInput = document.getElementById(`crocido-xpath-${fieldName}`);
+    
+    // Prioritize XPath from the input field if it exists and has a value
+    let xpathValue = field.xpath; // Default to what's in memory (could be from auto-select or previous load)
+    if (xpathInput && xpathInput.value.trim() !== '') {
+      xpathValue = xpathInput.value.trim();
+    } else if (xpathInput) { // Input exists but is empty, ensure we save empty
+        xpathValue = '';
     }
+    // If xpathValue is not null or an empty string after checks, save it.
+    // Allow saving empty/null XPaths if user cleared them.
+    // if (xpathValue) { // This was preventing clearing an XPath
+    currentConfigFromUI.selectors.push({
+      id: fieldName,
+      name: field.name, // Make sure 'name' is part of predefinedFieldSelectors object
+      xpath: xpathValue,
+      fieldType: fieldName // Assuming fieldName is also the fieldType
+    });
+    // Also update the in-memory predefinedFieldSelectors to match what will be saved
+    predefinedFieldSelectors[fieldName].xpath = xpathValue;
+    // }
   });
   
-  // Add custom fields from the customFieldSelectors object
-  Object.keys(customFieldSelectors).forEach(fieldKey => {
-    if (customFieldSelectors[fieldKey] && customFieldSelectors[fieldKey].xpath) { // Only save if an XPath is set
-      selectors.push({
-        id: fieldKey, // The sanitized key used in customFieldSelectors
-        name: customFieldSelectors[fieldKey].name, // The original display name
-        xpath: customFieldSelectors[fieldKey].xpath,
-        fieldType: customFieldSelectors[fieldKey].name, // Or perhaps a generic 'custom' type
-        isCustom: true
-      });
-    }
-  });
-
-  // Pagination
-  const paginationMethod = document.querySelector('input[name="paginationMethod"]:checked').value;
-  let paginationDetails = {};
-  if (paginationMethod === 'nextButton' || paginationMethod === 'loadMoreButton') {
-    paginationDetails.selector = document.getElementById('crocido-pagination-element-xpath').textContent || null;
-  } else if (paginationMethod === 'xhrInfinite') {
-    // XHR patterns are already part of currentConfigFromUI or updated directly from background
-    // We should ensure they are correctly added to the config object here
-    // Assuming currentConfigFromUI.detectedXhrPatterns is up-to-date
-     paginationDetails.xhrPatterns = currentConfigFromUI.detectedXhrPatterns || [];
-  }
-  
-  // Consolidate category URLs
-  // Start with a copy of manually entered URLs
+  // Consolidate category URLs before saving
   let consolidatedCategoryUrls = [...manualCategoryUrls]; 
-  // Add detected URLs, ensuring no duplicates
   detectedCategoryUrlsFromSitemap.forEach(url => {
       if (!consolidatedCategoryUrls.includes(url)) {
           consolidatedCategoryUrls.push(url);
       }
   });
-  // If you have other sources like detectedPageLinkCategoryUrls, add them similarly
+  currentConfigFromUI.categoryUrls = consolidatedCategoryUrls;
 
+  console.log("[Crocido] Config to save:", JSON.stringify(currentConfigFromUI, null, 2));
 
-  const config = {
-    configName: configName,
-    domain: domain,
-    productContainersXpath: detectedProductContainerXPath,
-    selectors: selectors,
-    paginationMethod: paginationMethod,
-    paginationDetails: paginationDetails,
-    categoryUrls: consolidatedCategoryUrls, // Use the consolidated list
-    // Include other necessary fields like detectedXhrPatterns if not covered by paginationDetails
-    // For XHR/Infinite, detectedXhrPatterns are crucial.
-    detectedXhrPatterns: paginationMethod === 'xhrInfinite' ? (currentConfigFromUI.detectedXhrPatterns || []) : []
-  };
-
-  console.log("Configuration to save:", config);
-  // Send to background script to save
-  chrome.runtime.sendMessage({
-    action: "saveConfiguration",
-    config: config
-  }, response => {
-    if (chrome.runtime.lastError) {
-      console.error("Error saving config:", chrome.runtime.lastError.message);
-      alert("Error saving config: " + chrome.runtime.lastError.message);
+  chrome.runtime.sendMessage({ action: "saveConfiguration", config: currentConfigFromUI }, response => {
+    if (chrome.runtime.lastError) { // It's good practice to check chrome.runtime.lastError first
+      console.error("[Crocido] Error sending saveConfiguration message:", chrome.runtime.lastError.message);
+      document.getElementById('crocido-status-message').textContent = "Error saving: " + chrome.runtime.lastError.message;
+    } else if (response && response.status && response.status.includes("Error")) { // Check response for error status
+      console.error("[Crocido] Failed to save configuration (error from background):", response.error || response.status);
+      document.getElementById('crocido-status-message').textContent = "Error saving configuration: " + (response.error || response.status);
+    } else if (response && response.activeConfig && response.activeConfig.id) { // Check for success based on typical response structure
+      console.log("[Crocido] Configuration saved successfully by background. Active config ID:", response.activeConfig.id);
+      document.getElementById('crocido-status-message').textContent = "Configuration saved!";
+      // Optionally, update currentConfigFromUI with the version returned from background (which includes ID and timestamps)
+      currentConfigFromUI = JSON.parse(JSON.stringify(response.activeConfig));
+      // loadConfigIntoUI(currentConfigFromUI); // Could reload to ensure UI consistency with saved state, if needed.
     } else {
-      console.log("Save config response:", response);
-      alert(response.status || "Configuration saved/updated.");
-      if (response.success) {
-          // Optionally close or reset UI
-          // toggleSetupMode(false); 
-      }
+      // Fallback for unexpected response structure
+      console.warn("[Crocido] Failed to save configuration or unexpected response structure:", response);
+      document.getElementById('crocido-status-message').textContent = "Error saving configuration or unexpected response.";
     }
+    setTimeout(() => {
+      if(document.getElementById('crocido-status-message')) {
+          document.getElementById('crocido-status-message').textContent = "";
+      }
+    }, 3000);
   });
 }
 
 function loadConfigIntoUI(config) {
-  if (!config) return;
-  if (!setupSidebar) createSetupUI(); // Ensure UI is created
-
-  console.log("Loading config into UI:", JSON.parse(JSON.stringify(config)));
-
-  // Config Name
-  const configNameInput = document.getElementById('crocido-config-name');
-  if (configNameInput) configNameInput.value = config.configName || `Config for ${config.domain || 'current site'}`;
-
-  // Product Containers
-  if (config.productContainersXpath) {
-    detectedProductContainerXPath = config.productContainersXpath;
-    selectedContainerXPaths = []; // Reset individual selections if loading a generalized one
-  }
-  updateContainerDetectionUI();
-
-  // Field Selectors
-  const fieldSelectorsDiv = document.getElementById('crocido-field-selectors');
-  if (fieldSelectorsDiv) {
-    const childrenToRemove = [];
-    for (let i = 0; i < fieldSelectorsDiv.children.length; i++) {
-        const child = fieldSelectorsDiv.children[i];
-        const fieldKey = child.querySelector('[data-field]')?.dataset.field;
-        // If it has a fieldKey and it's NOT in predefined, it's a custom one added by load/add
-        if (fieldKey && !predefinedFieldSelectors[fieldKey]) {
-            childrenToRemove.push(child);
-        }
-    }
-    childrenToRemove.forEach(child => child.remove());
-  }
-  customFieldSelectors = {}; // Clear custom selectors data
-  
-  // Reset XPaths for predefined fields before loading
-  Object.keys(predefinedFieldSelectors).forEach(fieldName => {
-    predefinedFieldSelectors[fieldName].xpath = ''; 
-  });
-
-  if (config.selectors && Array.isArray(config.selectors)) {
-    config.selectors.forEach(selector => {
-      // selector.id should be the key (sanitized name), selector.name is display name
-      const fieldKey = selector.id || selector.name; // Fallback to name if id is missing for older configs
-      if (predefinedFieldSelectors[fieldKey]) {
-        predefinedFieldSelectors[fieldKey].xpath = selector.xpath;
+  if (!setupSidebar) { // If sidebar isn't even up, don't try to load into it.
+      console.warn("[Crocido] loadConfigIntoUI: Setup sidebar not found. Aborting UI load.");
+      // Still, we should update the currentConfigFromUI and related global states
+      if (!config) {
+        currentConfigFromUI = createDefaultConfig(); // Use a function that returns a fresh default config object
+        detectedProductContainerXPath = null;
+        firstSelectedContainerXPath = null;
+        firstSelectedContainerElement = null;
+        manualCategoryUrls = [];
+        detectedCategoryUrlsFromSitemap = [];
+        Object.keys(predefinedFieldSelectors).forEach(key => {
+            if(predefinedFieldSelectors[key]) predefinedFieldSelectors[key].xpath = '';
+        });
       } else {
-        // This is a custom field from the loaded config
-        // Use the fieldKey (which should be the sanitized version if available) and original name for display
-        addCustomFieldFromConfig(fieldKey, selector.xpath, selector.name || fieldKey);
+        currentConfigFromUI = JSON.parse(JSON.stringify(config)); // Deep copy
+        detectedProductContainerXPath = currentConfigFromUI.productContainersXpath;
+        // firstSelectedContainerXPath and firstSelectedContainerElement are transient selection states, don't load.
+        manualCategoryUrls = Array.isArray(currentConfigFromUI.categoryUrls) ? currentConfigFromUI.categoryUrls.filter(url => typeof url === 'string') : [];
+        // detectedCategoryUrlsFromSitemap is also more of a session discovery thing.
+        // XHR patterns should be part of currentConfigFromUI
+
+        // Update predefinedFieldSelectors from the loaded config
+        Object.keys(predefinedFieldSelectors).forEach(key => {
+             if(predefinedFieldSelectors[key]) predefinedFieldSelectors[key].xpath = ''; // Reset first
+        });
+        if (currentConfigFromUI.selectors && Array.isArray(currentConfigFromUI.selectors)) {
+            currentConfigFromUI.selectors.forEach(selector => {
+            if (predefinedFieldSelectors[selector.id]) {
+                predefinedFieldSelectors[selector.id].xpath = selector.xpath;
+                predefinedFieldSelectors[selector.id].name = selector.name; // Ensure name is also updated
+            }
+            });
+        }
       }
+      return; // Exit if no sidebar to update
+  }
+
+  // If sidebar exists, proceed to update it.
+  if (!config) {
+    console.warn("[Crocido] loadConfigIntoUI: No config provided or config is null/undefined. Resetting UI to default.");
+    currentConfigFromUI = createDefaultConfig(); // Reset global working config
+    document.getElementById('crocido-config-name').value = currentConfigFromUI.configName;
+    
+    detectedProductContainerXPath = null;
+    // selectedContainerXPaths = []; // This is not directly used in load, more for selection process
+    productContainerSelectionMode = false; // Reset selection mode
+    firstSelectedContainerXPath = null;
+    firstSelectedContainerElement = null;
+
+    Object.keys(predefinedFieldSelectors).forEach(key => {
+        if(predefinedFieldSelectors[key]) predefinedFieldSelectors[key].xpath = '';
     });
-  }
-  updateAllFieldSelectorBlocksUI();
+    
+    manualCategoryUrls = [];
+    detectedCategoryUrlsFromSitemap = []; // Reset this as well
+    // currentConfigFromUI.paginationMethod is handled by createDefaultConfig()
+    // currentConfigFromUI.paginationDetails is handled by createDefaultConfig()
+    // currentConfigFromUI.categoryUrls is handled by createDefaultConfig()
+    // currentConfigFromUI.detectedXhrPatterns is handled by createDefaultConfig()
+    
+  } else {
+    console.log("[Crocido] Loading config into UI:", JSON.stringify(config, null, 2));
+    currentConfigFromUI = JSON.parse(JSON.stringify(config)); // Deep copy to our working config
 
-  // Category URLs
-  manualCategoryUrls = config.categoryUrls ? [...config.categoryUrls] : []; // Populate manual list from loaded config
-  // Note: detectedCategoryUrlsFromSitemap is typically live data and might not be part of a saved static config in this way,
-  // or if it is, decide if you want to merge or replace. For now, manual list takes loaded URLs.
-  renderManualCategoryUrls();
-  // If your config *also* stores sitemap URLs separately and you want to display them:
-  // detectedCategoryUrlsFromSitemap = config.sitemapUrls || []; // Example
-  // updateDetectedCategoryListUI(); // You'd need this function
+    document.getElementById('crocido-config-name').value = currentConfigFromUI.configName || `Config ${new Date().toISOString().slice(0,10)}`;
+    
+    detectedProductContainerXPath = currentConfigFromUI.productContainersXpath;
+    // selectedContainerXPaths = detectedProductContainerXPath ? [detectedProductContainerXPath] : []; 
+    productContainerSelectionMode = !detectedProductContainerXPath; // If XPath exists, not in selection mode initially.
 
-
-  // Pagination Method
-  const paginationMethodRadios = document.querySelectorAll('input[name="paginationMethod"]');
-  let foundPaginationMethod = false;
-  paginationMethodRadios.forEach(radio => {
-    if (radio.value === config.paginationMethod) {
-      radio.checked = true;
-      foundPaginationMethod = true;
-    } else {
-      radio.checked = false;
+    // Reset predefinedFieldSelectors before loading new ones from config
+    Object.keys(predefinedFieldSelectors).forEach(key => {
+        if(predefinedFieldSelectors[key]) predefinedFieldSelectors[key].xpath = '';
+    });
+    if (currentConfigFromUI.selectors && Array.isArray(currentConfigFromUI.selectors)) {
+      currentConfigFromUI.selectors.forEach(selector => {
+        if (predefinedFieldSelectors[selector.id]) {
+          predefinedFieldSelectors[selector.id].xpath = selector.xpath;
+          predefinedFieldSelectors[selector.id].name = selector.name; // Important for UI labels
+        }
+      });
     }
-  });
-  if (!foundPaginationMethod) { // Default to 'none' if not specified or invalid
-    const noneRadio = document.querySelector('input[name="paginationMethod"][value="none"]');
-    if (noneRadio) noneRadio.checked = true;
-  }
-  
-  // Trigger the change handler to show/hide relevant sections
-  handlePaginationMethodChange({ target: document.querySelector('input[name="paginationMethod"]:checked') });
-
-
-  // Pagination Details (Selector or XHR patterns)
-  if (config.paginationMethod === 'nextButton' || config.paginationMethod === 'loadMoreButton') {
-    const paginationElementXpathDisplay = document.getElementById('crocido-pagination-element-xpath');
-    if (paginationElementXpathDisplay && config.paginationDetails && config.paginationDetails.selector) {
-      paginationElementXpathDisplay.textContent = config.paginationDetails.selector;
-    } else if (paginationElementXpathDisplay) {
-      paginationElementXpathDisplay.textContent = ''; // Clear if no selector
-    }
-  } else if (config.paginationMethod === 'xhrInfinite') {
-    // XHR patterns should be part of the config.paginationDetails.xhrPatterns or config.detectedXhrPatterns
-    currentConfigFromUI.detectedXhrPatterns = (config.paginationDetails && config.paginationDetails.xhrPatterns) ? 
-                                              [...(config.paginationDetails.xhrPatterns)] : 
-                                              (config.detectedXhrPatterns ? [...(config.detectedXhrPatterns)] : []);
-    renderDetectedXhrPatterns();
+    
+    // paginationMethod and paginationDetails are part of currentConfigFromUI
+    
+    manualCategoryUrls = Array.isArray(currentConfigFromUI.categoryUrls) ? currentConfigFromUI.categoryUrls.filter(url => typeof url === 'string') : [];
+    // detectedXhrPatterns are part of currentConfigFromUI
   }
 
+  // Update all UI sections that depend on the loaded config
+  if (setupSidebar) { // Double check setupSidebar as it might have been destroyed if setup was toggled off
+    updateContainerDetectionUI();
+    updateAllFieldSelectorBlocksUI(); // This will now use the XPaths from predefinedFieldSelectors to populate inputs
+    renderPaginationMethod(); // Uses currentConfigFromUI
+    renderDetectedXhrPatterns(); // Uses currentConfigFromUI
+    renderManualCategoryUrls(); // Uses global manualCategoryUrls
+    updateDetectedCategoryListUI(); // Uses global detectedCategoryUrlsFromSitemap
+  }
+}
 
-  // Update currentConfigFromUI to reflect the loaded config
-  // This is important if other parts of the script rely on currentConfigFromUI being the source of truth for the UI's state.
-  currentConfigFromUI = JSON.parse(JSON.stringify(config)); // Deep copy
-
-  console.log("UI updated with loaded config. currentConfigFromUI set.");
-  document.getElementById('crocido-status-message').textContent = "Configuration loaded into UI.";
-  setTimeout(() => {
-    if(document.getElementById('crocido-status-message')) {
-      document.getElementById('crocido-status-message').textContent = "";
-    }
-  }, 3000);
+// Helper function to create a default config structure
+function createDefaultConfig() {
+    return {
+        configName: `New Config ${new Date().toISOString().slice(0,10)}`,
+        domain: window.location.hostname,
+        productContainersXpath: null,
+        selectors: [ // Initialize with all predefined fields having null/empty XPaths
+            { id: 'Title', name: 'Title', xpath: '', fieldType: 'Title'},
+            { id: 'Price', name: 'Price', xpath: '', fieldType: 'Price'},
+            { id: 'ImageSrc', name: 'ImageSrc', xpath: '', fieldType: 'ImageSrc'},
+            { id: 'Link', name: 'Link', xpath: '', fieldType: 'Link'}
+        ],
+        paginationMethod: 'none',
+        paginationDetails: {},
+        categoryUrls: [],
+        detectedXhrPatterns: []
+    };
 }
 
 function updateDetectedCategoryListUI() {

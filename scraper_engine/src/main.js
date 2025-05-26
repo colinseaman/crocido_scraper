@@ -4,7 +4,7 @@ const MAX_PAGINATION_CLICKS = 5; // Safety limit for development
 async function launchBrowser() {
   console.log("[ScraperEngine] launchBrowser: Launching browser...");
   const browser = await puppeteer.launch({
-    headless: false,
+    headless: 'new',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -19,78 +19,112 @@ async function launchBrowser() {
   return browser;
 }
 
+async function extractFieldData(page, contextNode, selectorConfig) {
+  let extractedValue = null;
+  const { xpath, fieldType, name: selectorName } = selectorConfig;
+
+  if (!xpath || xpath.trim() === '') {
+    console.warn(`[ScraperEngine] XPath for selector '${selectorName}' is empty. Skipping extraction.`);
+    return null;
+  }
+
+  try {
+    const elements = await contextNode.$x(xpath);
+    if (elements.length > 0) {
+      const element = elements[0]; // Use the first matched element
+
+      if (fieldType === 'ImageSrc' || selectorName === 'ImageSrc') {
+        extractedValue = await page.evaluate(el => el.src || el.getAttribute('data-src') || el.currentSrc, element);
+        if (extractedValue && typeof extractedValue === 'string' && !extractedValue.startsWith('http')) {
+            try {
+                extractedValue = new URL(extractedValue, page.url()).href;
+            } catch (e) {
+                console.warn(`[ScraperEngine] Could not construct absolute URL for ImageSrc: ${extractedValue}`);
+            }
+        }
+      } else if (fieldType === 'Link' || selectorName === 'Link') {
+        extractedValue = await page.evaluate(el => el.href, element);
+        if (extractedValue && typeof extractedValue === 'string' && !extractedValue.startsWith('http')) {
+            try {
+                extractedValue = new URL(extractedValue, page.url()).href;
+            } catch (e) {
+                console.warn(`[ScraperEngine] Could not construct absolute URL for Link: ${extractedValue}`);
+            }
+        }
+      } else if (xpath.includes('/@')) { // If XPath explicitly asks for an attribute
+            extractedValue = await page.evaluate(el => el.nodeValue, element);
+      }else {
+        extractedValue = await page.evaluate(el => el.textContent, element);
+      }
+
+      if (extractedValue && typeof extractedValue === 'string') {
+        extractedValue = extractedValue.trim();
+      }
+      console.log(`[ScraperEngine] Extracted value for '${selectorName}': '${extractedValue}'`);
+      await element.dispose();
+    } else {
+      console.log(`[ScraperEngine] No elements found for '${selectorName}' with XPath '${xpath}'`);
+    }
+  } catch (e) {
+    console.warn(`[ScraperEngine] Error processing selector ${selectorName} (${xpath}): ${e.message}`);
+  }
+  return extractedValue;
+}
+
 async function scrapePageContent(page, config) {
   let pageScrapedData = [];
   console.log(`[ScraperEngine] Scraping content from current page URL: ${page.url()}`);
   console.log(`[ScraperEngine] Using Product Container XPath: ${config.productContainersXpath || '(Whole Page)'}`);
 
-  const productElementsHandles = config.productContainersXpath 
-    ? await page.$x(config.productContainersXpath) 
-    : [page]; // Treat the whole page as one container if no specific XPath
+  try {
+    await page.screenshot({ path: 'debug_before_xpath_wait.png' });
+    console.log("[ScraperEngine] Screenshot taken: debug_before_xpath_wait.png");
+  } catch (screenShotError) {
+    console.error("[ScraperEngine] Error taking screenshot before XPath wait: ", screenShotError.message);
+  }
+
+  if (config.productContainersXpath) {
+    try {
+      console.log(`[ScraperEngine] Waiting for product containers to appear with XPath: ${config.productContainersXpath}`);
+      await page.waitForXPath(config.productContainersXpath, { timeout: 30000 });
+      console.log("[ScraperEngine] Product containers found or timeout reached.");
+    } catch (e) {
+      console.warn(`[ScraperEngine] Timeout or error waiting for product containers XPath: ${config.productContainersXpath} - ${e.message}`);
+      // Continue anyway, maybe some are there or it's a false negative for waitForXPath
+    }
+  }
+
+  const productElementsHandles = config.productContainersXpath
+    ? await page.$x(config.productContainersXpath)
+    : [page]; // Treat the whole page as one container
 
   console.log(`[ScraperEngine] Found ${productElementsHandles.length} product containers (or page as container).`);
 
   for (const productHandle of productElementsHandles) {
-    let product = {};
-    let isSinglePageContainer = !config.productContainersXpath;
-
-    // For debugging: Get HTML of the current product handle or page
-    // const productHtml = await page.evaluate(el => el.outerHTML || el.innerHTML, productHandle);
-    // console.log(`[ScraperEngine] HTML of current context/container: ${productHtml.substring(0, 500)}...`);
+    let item = {};
+    const isSinglePageContainer = !config.productContainersXpath;
+    const contextNode = isSinglePageContainer ? page : productHandle;
 
     for (const selector of config.selectors) {
-      try {
-        let value = null;
-        const contextNode = isSinglePageContainer ? page : productHandle;
-        let effectiveXPath = selector.xpath;
-
-        if (!isSinglePageContainer) { 
-          if (selector.xpath.startsWith('id(')) {
-            // No change to effectiveXPath needed here if it starts with id()
-          } else if (selector.xpath.startsWith('//')) {
-            effectiveXPath = '.' + selector.xpath;
-          } else if (!selector.xpath.startsWith('.') && !selector.xpath.startsWith('(')) {
-            effectiveXPath = './/' + selector.xpath;
-          }
+      let effectiveXPath = selector.xpath;
+      if (selector.xpath && selector.xpath.trim() !== '') { // Only modify if xpath is not empty
+        if (!isSinglePageContainer && !selector.xpath.startsWith('.') && !selector.xpath.startsWith('id(') && !selector.xpath.startsWith('(')) {
+          effectiveXPath = '.' + (selector.xpath.startsWith('/') ? selector.xpath : '//' + selector.xpath);
         }
-        console.log(`[ScraperEngine] Processing selector: '${selector.name}', Original XPath: '${selector.xpath}', Effective XPath: '${effectiveXPath}'`);
-        const elements = await contextNode.$x(effectiveXPath);
-        console.log(`[ScraperEngine] Found ${elements.length} elements for '${selector.name}' with XPath '${effectiveXPath}'`);
-        
-        if (elements.length > 0) {
-          const firstElement = elements[0];
-          if (selector.xpath.includes('/@')) { // If XPath explicitly asks for an attribute
-            value = await page.evaluate(el => el.nodeValue, firstElement);
-          } else {
-            // Check if this selector is for an image and try to get src, then textContent as fallback
-            const tagName = await page.evaluate(el => el.tagName.toLowerCase(), firstElement);
-            if (tagName === 'img') {
-              value = await page.evaluate(el => el.getAttribute('src') || el.getAttribute('data-src'), firstElement);
-              if (!value) { // Fallback for some lazy-loaded images or other attributes
-                value = await page.evaluate(el => el.currentSrc || el.src, firstElement);
-              }
-              console.log(`[ScraperEngine] Attempted to get 'src' or 'data-src' for <img> for selector '${selector.name}'. Value: '${value}'`);
-            }
-            // If not an img or src wasn't found, get textContent (or if src was found but empty, this will overwrite, which is fine for now)
-            if (value === null || value === undefined || value === '') { 
-              value = await page.evaluate(el => el.textContent.trim(), firstElement);
-            }
-          }
-          console.log(`[ScraperEngine] Extracted value for '${selector.name}': '${value}'`);
-          await firstElement.dispose(); 
-        }
-        product[selector.name] = value;
-      } catch (e) {
-        console.warn(`[ScraperEngine] Error processing selector ${selector.name} (${selector.xpath}): ${e.message}`);
-        product[selector.name] = null;
+      } else {
+        effectiveXPath = ''; // Ensure it's truly empty if original was empty
       }
+      console.log(`[ScraperEngine] Processing selector: '${selector.name}', Original XPath: '${selector.xpath}', Effective XPath: '${effectiveXPath}'`);
+      item[selector.name] = await extractFieldData(page, contextNode, { ...selector, xpath: effectiveXPath });
     }
-    // Mandatory fields check - ensure 'Link' is also there.
-    if (!product.Title || !product.Price || !product.Link) { // Added !product.Link
-      console.log("[ScraperEngine] Skipping product due to missing mandatory fields (Title, Price, or Link):", JSON.stringify(product));
+
+    // Mandatory fields check
+    if (item.Title && item.Price && item.Link) {
+      pageScrapedData.push(item);
     } else {
-      pageScrapedData.push(product);
+      console.log(`[ScraperEngine] Skipping product due to missing mandatory fields (Title, Price, or Link): ${JSON.stringify(item)}`);
     }
+
     if (!isSinglePageContainer && productHandle.dispose) {
       await productHandle.dispose();
     }
@@ -99,9 +133,9 @@ async function scrapePageContent(page, config) {
 }
 
 async function scrapeCategory(browser, initialUrl, config) {
-  let page; // Define page here to access in finally block
-  let clickCount = 0; // Initialize clickCount here
-  let allCategoryData = []; // Initialize here
+  let page;
+  let clickCount = 0;
+  let allCategoryData = [];
   console.log(`[ScraperEngine] scrapeCategory: Starting for URL: ${initialUrl}`);
   try {
     page = await browser.newPage();
@@ -110,174 +144,222 @@ async function scrapeCategory(browser, initialUrl, config) {
 
     if (config.headers) {
       console.log("[ScraperEngine] Note: Header setting might require puppeteer-extra or Playwright.");
+      // If you were to set headers: await page.setExtraHTTPHeaders(config.headers);
     }
     console.log(`[ScraperEngine] Navigating to initial category URL: ${initialUrl}`);
-    await page.goto(initialUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(initialUrl, { waitUntil: 'networkidle2', timeout: 60000 });
     console.log(`[ScraperEngine] Successfully navigated to: ${initialUrl}`);
 
-    // Attempt to click the cookie consent button
+    const cookieBannerSelector = '#onetrust-banner-sdk';
     try {
-      const cookieButtonSelector = '#onetrust-accept-btn-handler';
-      console.log(`[ScraperEngine] Looking for cookie button: ${cookieButtonSelector}`);
-      await page.waitForSelector(cookieButtonSelector, { visible: true, timeout: 10000 });
-      await page.click(cookieButtonSelector);
-      console.log("[ScraperEngine] Clicked cookie consent button (onetrust-accept-btn-handler).");
-      await page.waitForTimeout(2000); // Wait for banner to disappear and page to settle
+      console.log("[ScraperEngine] Attempting to find and click cookie consent button by prioritized text content...");
+      const clickResult = await page.evaluate(() => {
+        const orderedKeywords = [
+          "Accept All Cookies", "Accept all cookies", "Continue and accept", "Continue & accept",
+          "Allow All Cookies", "Allow all cookies", "Accept All", "Accept all", "Allow All", "Allow all",
+          "Agree to All", "Agree To All", "Agree and Continue", "Yes, I Accept", "Yes, I Agree",
+          "I Accept", "I Agree", "Accept & Continue", "Continue & Accept", "Proceed and Agree",
+          "Agree and Proceed", "OK and Continue", "Continue and OK", "Accept", "Agree", "OK",
+          "Okay", "Continue", "Proceed", "Understood", "Got it", "Alle akzeptieren", "Akzeptieren",
+          "Tout accepter", "Accepter", "Aceptar todo", "Aceptar"
+        ];
+        const elementSelectors = ['button', 'a', '[role="button"]'];
+        for (const keyword of orderedKeywords) {
+          for (const sel of elementSelectors) {
+            const elements = Array.from(document.querySelectorAll(sel));
+            for (const el of elements) {
+              if (!el) continue;
+              const textContent = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim();
+              if (textContent.toLowerCase().includes(keyword.toLowerCase())) {
+                const lowerText = textContent.toLowerCase();
+                if (keyword.length <= 8 && ["accept", "agree", "ok", "okay", "continue", "proceed"].includes(keyword.toLowerCase())) {
+                  if (lowerText.includes("setting") || lowerText.includes("preference") ||
+                      lowerText.includes("manage") || lowerText.includes("choose") ||
+                      lowerText.includes("select") || lowerText.includes("customise") ||
+                      lowerText.includes("more info") || lowerText.includes("learn more")) {
+                     const isMoreSpecificAccept = orderedKeywords.slice(0, 15).some(specificKw => lowerText.includes(specificKw.toLowerCase()));
+                     if (!isMoreSpecificAccept) {
+                        console.log(`Puppeteer Evaluate: Skipping element with text "${textContent}" (matched general keyword "${keyword}") due to preference-like words.`);
+                        continue;
+                     }
+                  }
+                }
+                const isVisible = el.offsetParent !== null;
+                const isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+                if (isVisible && !isDisabled) {
+                  el.click();
+                  console.log(`Puppeteer Evaluate: Clicked element with text: "${textContent}" matching keyword: "${keyword}"`);
+                  return { clicked: true, text: textContent, keywordMatch: keyword };
+                }
+              }
+            }
+          }
+        }
+        return { clicked: false, text: null, keywordMatch: null };
+      });
+
+      if (clickResult.clicked) {
+        console.log(`[ScraperEngine] Clicked cookie button with text: ${clickResult.text} (matched keyword: ${clickResult.keywordMatch})`);
+        await page.waitForTimeout(3500);
+      } else {
+        console.warn("[ScraperEngine] No cookie consent button found or clicked via prioritized text content search.");
+        await page.screenshot({ path: 'debug_cookie_consent_error.png' });
+      }
+
+      const bannerElement = await page.$(cookieBannerSelector);
+      if (bannerElement) {
+        const bannerIsVisible = await page.evaluate(sel => {
+          const elem = document.querySelector(sel);
+          if (!elem) return false;
+          const style = window.getComputedStyle(elem);
+          return style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && elem.offsetHeight > 0;
+        }, cookieBannerSelector);
+        if (bannerIsVisible) {
+            console.warn(`[ScraperEngine] Cookie banner (${cookieBannerSelector}) appears to STILL BE VISIBLE.`);
+            await page.screenshot({ path: 'debug_cookie_banner_still_visible.png' });
+        } else {
+            console.log(`[ScraperEngine] Cookie banner (${cookieBannerSelector}) no longer visible or was never found.`);
+        }
+      } else {
+        console.log(`[ScraperEngine] Cookie banner (${cookieBannerSelector}) not found by selector.`);
+      }
     } catch (e) {
-      console.log("[ScraperEngine] Cookie consent button (onetrust-accept-btn-handler) not found or timed out. Continuing...");
+      console.warn(`[ScraperEngine] Error during cookie consent: ${e.message}. Continuing...`);
+      await page.screenshot({ path: 'debug_cookie_consent_exception.png' });
     }
 
-    // The main while loop for scraping and pagination
     while (clickCount < MAX_PAGINATION_CLICKS) {
-      console.log(`[ScraperEngine] scrapeCategory: Start of pagination loop iteration ${clickCount + 1}`);
+      console.log(`[ScraperEngine] scrapeCategory: Pagination loop iteration ${clickCount + 1}`);
       const initialDataLength = allCategoryData.length;
       const newData = await scrapePageContent(page, config);
-      
-      if (config.paginationMethod === 'xhrInfinite' && allCategoryData.length > 0) {
-         console.log(`[ScraperEngine] XHR scroll: Previously had ${initialDataLength}, scraped ${newData.length} this iteration.`);
-      }
       allCategoryData = allCategoryData.concat(newData);
-      if (allCategoryData.length > initialDataLength && config.selectors.some(s => s.name === 'Link')) {
+
+      // Basic deduplication based on Link if available
+      if (config.selectors.some(s => s.name === 'Link')) {
           const uniqueLinks = new Set();
           allCategoryData = allCategoryData.filter(item => {
-              if (!item.Link || !uniqueLinks.has(item.Link)) {
-                  if(item.Link) uniqueLinks.add(item.Link);
+              if (item.Link && !uniqueLinks.has(item.Link)) {
+                  uniqueLinks.add(item.Link);
+                  return true;
+              } else if (!item.Link) { // Keep items without a link if Link selector wasn't successful
                   return true;
               }
               return false;
           });
-      }      
-      console.log(`[ScraperEngine] Scraped items after potential deduplication. Total for category: ${allCategoryData.length}`);
+      }
+      console.log(`[ScraperEngine] Scraped items after deduplication. Total for category: ${allCategoryData.length}`);
+      if (newData.length === 0 && clickCount > 0) { // If a pagination click yielded no new items
+          console.log("[ScraperEngine] No new items found after pagination click. Assuming end of content.");
+          break;
+      }
 
-      if ((config.paginationMethod === 'nextButton' || config.paginationMethod === 'loadMoreButton') && 
+      if ((config.paginationMethod === 'nextButton' || config.paginationMethod === 'loadMoreButton') &&
           config.paginationDetails && config.paginationDetails.selector) {
-        
         const buttonSelector = config.paginationDetails.selector;
-        console.log(`[ScraperEngine] Attempting to find and click pagination button: ${buttonSelector}`);
-        
+        console.log(`[ScraperEngine] Attempting pagination click: ${buttonSelector}`);
         const buttonElement = await page.$(buttonSelector);
-
         if (buttonElement) {
           const isVisible = await page.evaluate(el => el.offsetParent !== null, buttonElement);
           if (!isVisible) {
-            console.log("[ScraperEngine] Pagination button found but not visible. Stopping pagination.");
+            console.log("[ScraperEngine] Pagination button found but not visible. Stopping.");
             break;
           }
           try {
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(500); // Small pause before click
             await Promise.all([
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => console.log('[ScraperEngine] Navigation timeout/no navigation after click, continuing...')),
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => console.log('[ScraperEngine] No navigation after click, or timeout.')),
                 buttonElement.click()
             ]);
             console.log("[ScraperEngine] Clicked pagination button.");
             await buttonElement.dispose();
             clickCount++;
-            await page.waitForTimeout(config.xhrInfiniteScrollDelay || 2000);
+            await page.waitForTimeout(config.paginationDetails.delay || 3000); // Wait for content
           } catch (clickError) {
-            console.error(`[ScraperEngine] Error clicking pagination button (${buttonSelector}): ${clickError.message}. Stopping pagination.`);
+            console.error(`[ScraperEngine] Error clicking pagination button: ${clickError.message}. Stopping.`);
             await buttonElement.dispose().catch(()=>{});
             break;
           }
         } else {
-          console.log("[ScraperEngine] Pagination button not found. Stopping pagination for this category.");
+          console.log("[ScraperEngine] Pagination button not found. Stopping.");
           break;
         }
       } else if (config.paginationMethod === 'xhrInfinite') {
-        console.log(`[ScraperEngine] Performing XHR/Infinite scroll (attempt ${clickCount + 1}/${MAX_PAGINATION_CLICKS})`);
+        console.log(`[ScraperEngine] XHR/Infinite scroll (attempt ${clickCount + 1})`);
         try {
           await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight); });
-          console.log("[ScraperEngine] Scrolled to bottom of page.");
+          console.log("[ScraperEngine] Scrolled to bottom.");
           const scrollWaitTimeout = config.paginationDetails?.xhrInfiniteScrollDelay || 3000;
-          let waitedForXHR = false;
-          if (config.detectedXhrPatterns && config.detectedXhrPatterns.length > 0) {
-            console.log(`[ScraperEngine] Attempting to wait for XHRs based on ${config.detectedXhrPatterns.length} detected patterns.`);
-            const xhrPromises = config.detectedXhrPatterns.map(pattern => {
-              return page.waitForResponse(
-                response => response.url().includes(pattern.url) && response.ok(),
-                { timeout: scrollWaitTimeout }
-              ).then(response => {
-                console.log(`[ScraperEngine] XHR detected matching pattern: ${pattern.url}, Status: ${response.status()}`);
-                return true;
-              }).catch(() => { return false; });
-            });
-            try {
-              const results = await Promise.allSettled(xhrPromises);
-              if (results.some(r => r.status === 'fulfilled' && r.value === true)) {
-                console.log("[ScraperEngine] At least one detected XHR pattern matched and completed.");
-                waitedForXHR = true;
-              } else {
-                console.log("[ScraperEngine] No detected XHR patterns matched within timeout. Falling back to fixed delay.");
-              }
-            } catch (e) {
-              console.warn("[ScraperEngine] Error during XHR checks. Falling back to fixed delay.", e.message);
-            }
-          }
-          if (!waitedForXHR) {
-            console.log(`[ScraperEngine] Waiting for fixed ${scrollWaitTimeout}ms for content to load after scroll...`);
-            await page.waitForTimeout(scrollWaitTimeout);
-          }
+          // Simplified: just wait after scroll. More complex XHR detection can be added.
+          await page.waitForTimeout(scrollWaitTimeout);
+          console.log(`[ScraperEngine] Waited ${scrollWaitTimeout}ms after scroll.`);
           clickCount++;
         } catch (scrollError) {
-          console.error(`[ScraperEngine] Error during programmatic scroll or XHR wait: ${scrollError.message}. Stopping pagination.`);
+          console.error(`[ScraperEngine] Error during scroll: ${scrollError.message}. Stopping.`);
           break;
         }
-        if (clickCount >= MAX_PAGINATION_CLICKS) {
-            console.log("[ScraperEngine] Reached max XHR scroll attempts.");
-            break;
-        }
       } else {
-        console.log("[ScraperEngine] No further pagination configured. Ending scrape for this category.");
+        console.log("[ScraperEngine] No further pagination. Ending scrape for category.");
         break;
       }
-      console.log(`[ScraperEngine] scrapeCategory: End of pagination loop iteration ${clickCount}`);
     }
   } catch (error) {
-      console.error(`[ScraperEngine] Error during scraping category ${initialUrl}: ${error.message}`, error.stack);
+      console.error(`[ScraperEngine] Error in scrapeCategory ${initialUrl}: ${error.message}`, error.stack);
   } finally {
-    console.log(`[ScraperEngine] scrapeCategory: Entering finally block for ${initialUrl}`);
+    console.log(`[ScraperEngine] scrapeCategory: finally block for ${initialUrl}`);
     if (page && !page.isClosed()) {
       try {
-        console.log(`[ScraperEngine] scrapeCategory: Attempting to close page for ${initialUrl}`);
         await page.close();
-        console.log(`[ScraperEngine] scrapeCategory: Successfully closed page for ${initialUrl}`);
+        console.log(`[ScraperEngine] Successfully closed page for ${initialUrl}`);
       } catch (closeError) {
-        console.error(`[ScraperEngine] scrapeCategory: Error closing page for ${initialUrl}: ${closeError.message}`);
+        console.error(`[ScraperEngine] Error closing page for ${initialUrl}: ${closeError.message}`);
       }
-    } else {
-      console.log(`[ScraperEngine] scrapeCategory: Page for ${initialUrl} was already closed or not initialized.`);
     }
-  }
-  
-  if (clickCount >= MAX_PAGINATION_CLICKS) {
-    console.warn(`[ScraperEngine] Reached max pagination clicks (${MAX_PAGINATION_CLICKS}) for ${initialUrl}.`);
   }
   return allCategoryData;
 }
 
 async function start(config) {
-  if (!config || !config.categoryUrls || config.categoryUrls.length === 0) {
-    console.error("Scraper start failed: No category URLs provided in config.");
-    return { error: "No category URLs" };
-  }
-
-  const browser = await launchBrowser();
+  console.log(`[ScraperEngine] Starting scraper engine for config: ${config.id}`);
   let allScrapedData = [];
+  const configToUse = config; // Assuming config is already parsed and validated by the service
 
-  for (const categoryUrl of config.categoryUrls) {
-    console.log(`Starting scrape for category: ${categoryUrl}`);
+  if (!configToUse.categoryUrls || configToUse.categoryUrls.length === 0) {
+    console.warn("[ScraperEngine] No category URLs provided.");
+    return [];
+  }
+  console.log(`[ScraperEngine] Processing ${configToUse.categoryUrls.length} category URLs.`);
+
+  for (const categoryUrl of configToUse.categoryUrls) {
+    let browser = null;
     try {
-      const categoryData = await scrapeCategory(browser, categoryUrl, config);
-      allScrapedData = allScrapedData.concat(categoryData);
-      console.log(`Finished category ${categoryUrl}, scraped ${categoryData.length} items. Total overall: ${allScrapedData.length}`);
-      // TODO: Save data to Postgres progressively
-    } catch (error) {
-      console.error(`Error scraping category ${categoryUrl}: ${error.message}`);
+      console.log(`[ScraperEngine] Launching browser for category: ${categoryUrl}`);
+      browser = await launchBrowser();
+      if (!browser) {
+        console.error(`[ScraperEngine] Failed to launch browser for ${categoryUrl}. Skipping.`);
+        continue;
+      }
+      const categoryData = await scrapeCategory(browser, categoryUrl, configToUse);
+      if (categoryData && categoryData.length > 0) {
+        allScrapedData = allScrapedData.concat(categoryData);
+      }
+      console.log(`Finished category ${categoryUrl}, scraped ${categoryData ? categoryData.length : 0} items. Total overall: ${allScrapedData.length}`);
+    } catch (categoryError) {
+      console.error(`[ScraperEngine] Critical error for category ${categoryUrl}: ${categoryError.message}`, categoryError.stack);
+    } finally {
+      if (browser) {
+        try {
+          console.log(`[ScraperEngine] Closing browser for category: ${categoryUrl}`);
+          await browser.close();
+          console.log(`[ScraperEngine] Successfully closed browser for ${categoryUrl}`);
+        } catch (closeError) {
+          console.error(`[ScraperEngine] Error closing browser for ${categoryUrl}: ${closeError.message}`);
+        }
+      }
     }
   }
 
-  await browser.close();
   console.log(`Total items scraped from all categories: ${allScrapedData.length}`);
-  return { data: allScrapedData, count: allScrapedData.length };
+  return allScrapedData;
 }
 
 module.exports = {
